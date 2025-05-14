@@ -2,18 +2,19 @@
 import argparse
 import sys
 import logging
-import time
-from threading import Thread, Event
+import time  # Keep for time.sleep if needed, or remove if not used
+from threading import Thread, Event, current_thread as get_current_thread
 import signal
 from pathlib import Path
 
 from .utils import load_config, setup_logging, get_config
-# Import the main run function and maintenance thread function
-from .core import run_person_detection_loop, archive_maintenance_thread_func
-from . import APP_NAME, __version__ # From __init__.py
+from .person_detector_core import run_person_detection_loop
+from .archive_manager import archive_maintenance_thread_func  # Import from new file
+from . import APP_NAME, __version__
 
 logger = logging.getLogger(APP_NAME)
 stop_event_global = Event()
+
 
 def signal_handler(signum, frame):
     signal_name = signal.Signals(signum).name
@@ -21,7 +22,9 @@ def signal_handler(signum, frame):
     if not stop_event_global.is_set():
         stop_event_global.set()
 
+
 def main(argv=None):
+    get_current_thread().name = "MainCLIThread"
     p = argparse.ArgumentParser(
         description=f"{APP_NAME} - Person Detection & Recording System",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -34,61 +37,57 @@ def main(argv=None):
     config_data = None
     try:
         config_data = load_config(args.config)
-    except Exception as e: # Catch broader exceptions during initial load
-        logging.basicConfig(level=logging.ERROR)
+    except Exception as e:
+        logging.basicConfig(level=logging.ERROR)  # Basic log for early fail
         logger.fatal(f"Failed to load or parse configuration '{args.config}': {e}", exc_info=True)
         sys.exit(1)
 
-    setup_logging() # Setup logging based on loaded config
+    setup_logging()
 
     logger.info(f"Starting {APP_NAME} v{__version__}...")
     logger.info(f"Using configuration: {Path(args.config).resolve()}")
-    # Log some key settings
-    logger.info(f"RTSP URL: {config_data.get('rtsp',{}).get('url')}")
-    logger.info(f"Model: {config_data.get('inference',{}).get('model_path')}, Device: {config_data.get('inference',{}).get('device')}")
-    logger.info(f"Recording to: {config_data.get('person_event_recording',{}).get('output_directory')}")
-
+    logger.info(f"RTSP URL: {config_data.get('rtsp', {}).get('url')}")
+    logger.info(
+        f"Model: {config_data.get('inference', {}).get('model_path')}, Device: {config_data.get('inference', {}).get('device')}")
+    logger.info(f"Recording to: {config_data.get('person_event_recording', {}).get('output_directory')}")
+    logger.info(f"Confidence threshold for person: {config_data.get('inference', {}).get('confidence_threshold')}")
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # --- Thread for Archive Maintenance ---
     maintenance_th = None
     if config_data.get('archive_maintenance', {}).get('enabled', False):
         maintenance_th = Thread(
             target=archive_maintenance_thread_func,
-            args=(stop_event_global, config_data), # Pass full config
-            name="ArchiveMaintThread",
+            args=(stop_event_global, config_data),
+            name="ArchiveMaintThread",  # Name set inside the function now
             daemon=True
         )
         maintenance_th.start()
-        logger.info("Archive maintenance thread started.")
+        # logger is now inside archive_maintenance_thread_func
 
-    # --- Run main detection loop in the main thread ---
-    # This simplifies state management for recording and display.
-    # The capture itself is in a thread started by run_person_detection_loop.
     try:
         run_person_detection_loop(stop_event_global, config_data)
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt in main execution. Signaling shutdown.")
-        if not stop_event_global.is_set():
-            stop_event_global.set()
+        if not stop_event_global.is_set(): stop_event_global.set()
     except Exception as e:
-        logger.critical(f"Unhandled exception in main execution: {e}", exc_info=True)
-        if not stop_event_global.is_set():
-            stop_event_global.set() # Ensure shutdown on critical error
+        logger.critical(f"Unhandled exception in main CLI execution: {e}", exc_info=True)
+        if not stop_event_global.is_set(): stop_event_global.set()
     finally:
-        logger.info("Main execution loop finished or interrupted. Finalizing shutdown...")
+        logger.info("Main CLI execution loop finished or interrupted. Finalizing shutdown...")
 
         if maintenance_th and maintenance_th.is_alive():
             logger.info("Waiting for archive maintenance thread to complete...")
-            maintenance_th.join(timeout=10.0) # Give it time to finish current cycle if any
+            # stop_event_global is already set, maintenance_th should see it on its wait()
+            maintenance_th.join(timeout=12.0)  # Wait a bit longer for it
             if maintenance_th.is_alive():
                 logger.warning("Archive maintenance thread did not stop in time.")
 
         logger.info(f"{APP_NAME} has shut down.")
         logging.shutdown()
         sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

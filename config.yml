@@ -17,7 +17,7 @@ inference:
   # For COCO-trained models (like standard YOLO), 'person' is usually class ID 0.
   person_class_id: 0
   process_every_nth_frame: 1 # Process 1 out of N frames. 1 = process all.
-  device: "cpu" # or "cuda:0" for GPU if ONNXRuntime-GPU & CUDA are set up
+  device: "cuda:0" # or "cuda:0" for GPU if ONNXRuntime-GPU & CUDA are set up
 
 person_event_recording:
   enabled: true

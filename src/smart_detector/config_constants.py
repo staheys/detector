@@ -1,4 +1,4 @@
-# src/smart_detector/config.py
+# src/smart_detector/config_constants.py
 # For UI display constants (OpenCV related)
 import cv2
 
