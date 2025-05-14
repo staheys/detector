@@ -1,8 +1,15 @@
-# src/smart_detector/__init__.py
-from importlib.metadata import version
+try:
+    from importlib.metadata import version, PackageNotFoundError
+    try:
+        # Match the name in pyproject.toml
+        __version__ = version("smart-detector-person")
+    except PackageNotFoundError:
+        __version__ = "0.0.0-dev"
+except ImportError:
+    import pkg_resources
+    try:
+        __version__ = pkg_resources.get_distribution("smart-detector-person").version
+    except pkg_resources.DistributionNotFound:
+        __version__ = "0.0.0-dev"
 
-__version__ = version("smart-detector") # If your package is installed
-
-# You can re-export key functions or variables if desired
-# from .core import some_function
-# from .utils import get_config
+APP_NAME = "PersonDetector"

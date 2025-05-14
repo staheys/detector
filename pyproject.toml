@@ -1,19 +1,20 @@
 [project]
 name = "smart-detector"
-version = "0.2.0" # Incremented version
+version = "0.2.0"
 description = "Smart detection system with RTSP, YOLOv9-ONNX, Archiving, and ZeroMQ"
-authors = [{name = "You", email = "you@example.com"}] # Update as needed
+authors = [{name = "Your Name", email = "you@example.com"}] # Please update
 readme = "README.md"
-requires-python = ">=3.9" # Adjusted based on type hinting and features
+requires-python = ">=3.9"
 
 dependencies = [
     "ultralytics>=8.1.0",
-    "opencv-python>=4.10.0", # Or opencv-python-headless
+    "opencv-python>=4.10.0", # Use opencv-python-headless for server environments without GUI needs
     "rich>=13.0.0",
     "pyzmq>=25.0.0",
     "PyYAML>=6.0",
-    "numpy>=1.20" # Usually a sub-dependency, but good to specify
-    # "onnxruntime" # Add if you switch to direct ONNXRuntime and not via ultralytics
+    "numpy>=1.20"
+    # "onnxruntime" # Add if you use ONNXRuntime directly and Ultralytics doesn't manage it for you.
+    # "onnxruntime-gpu" # For GPU acceleration with ONNXRuntime.
 ]
 
 [project.scripts]
@@ -24,10 +25,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "src/smart_detector/__init__.py" # If you want to manage version in __init__.py
-
-# Optional: for linters/formatters if you use them
-# [tool.black]
-# line-length = 88
-# [tool.isort]
-# profile = "black"
+path = "src/smart_detector/__init__.py"

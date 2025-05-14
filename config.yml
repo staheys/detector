@@ -1,60 +1,54 @@
-# config.yml
+# config.yml (New Version for Person Detection Focus)
 app:
-  project_root: "." # Can be set dynamically or assumes script runs from project root
+  project_root: "." # Assumes script runs from project root, or paths are relative to this file
 
 rtsp:
-  url: "rtsp://admin:qwerty13579@192.168.0.3:554/Streaming/Channels/102" # Replace with your RTSP stream or 0 for webcam
+  url: "rtsp://admin:qwerty13579@192.168.0.3:554/Streaming/Channels/102" # !!! REPLACE with your RTSP stream or 0 for webcam !!!
   # url: 0 # For webcam testing
-  capture_resolution_width: 640 # Desired capture width (camera must support)
-  capture_resolution_height: 480 # Desired capture height
-  capture_fps: 25 # Desired capture FPS
-  resilience_buffer_size: 125 # Frames (e.g., 5 seconds * 25 FPS)
+  capture_resolution_width: 640 # Consider 1280x720 for lighter load
+  capture_resolution_height: 480
+  capture_fps: 15 # Desired capture/processing FPS. Camera should support this.
   reconnect_delay_seconds: 5
 
 inference:
-  model_path: "src/smart_detector/weights/yolo11n.pt" # Path to your ONNX model
-  confidence_threshold: 0.25
-  iou_threshold: 0.45 # NMS IOU threshold
-  # Class names mapped to model's integer IDs.
-  # These IDs depend on your specific ONNX model.
-  # Ultralytics YOLO models typically start person at 0.
-  # Check your model's metadata or training configuration.
-  classes_map:
-    0: "person"
-    1: "ppe_helmet" # Example, adjust to your model's classes
-    2: "ppe_vest"   # Example
-    3: "cargo_box"  # Example
-  # Which class IDs from classes_map to actually detect and report
-  active_class_ids: [0, 1, 2, 3]
-  device: "cpu" # or "cuda:0" for GPU if supported and ONNXRuntime-GPU is installed
-  process_every_nth_frame: 2 # Process 1 out of every N frames
+  model_path: "models/yolov8n.pt" # Path to your ONNX model
+  confidence_threshold: 0.40 # Confidence for detecting a person
+  # Ensure this class ID corresponds to "person" in your ONNX model
+  # For COCO-trained models (like standard YOLO), 'person' is usually class ID 0.
+  person_class_id: 0
+  process_every_nth_frame: 1 # Process 1 out of N frames. 1 = process all.
+  device: "cpu" # or "cuda:0" for GPU if ONNXRuntime-GPU & CUDA are set up
 
-archiving:
+person_event_recording:
   enabled: true
-  base_path: "archive_data" # Relative to project_root or absolute
-  continuous_recording_fps: 10 # FPS for hourly segments
-  hourly_segment_duration_minutes: 60
-  clip_event_buffer_seconds: 15 # How many seconds of frames to keep in memory for clip generation
-  clip_pre_event_seconds: 3    # Seconds before event to include in clip
-  clip_post_event_seconds: 7   # Seconds after event to include in clip (total clip_duration_seconds from req)
-  max_archive_days: 30
-  min_disk_free_gb_threshold: 10 # Minimum free GB to maintain
-  cleanup_interval_seconds: 3600 # How often to check for old files (1 hour)
+  # Directory where person-triggered video clips will be saved.
+  # Relative to project_root or absolute.
+  output_directory: "person_clips"
+  # How many seconds of frames to keep in a rolling buffer.
+  # This buffer is used for pre-event recording and to ensure smooth clip transitions.
+  # Should be at least pre_event_seconds + a small margin.
+  frame_buffer_seconds: 8
+  # How many seconds of video to include *before* a person is initially detected.
+  pre_event_seconds: 3
+  # If no person is detected for this many seconds, the current recording segment ends.
+  post_event_timeout_seconds: 5
+  # Clip FPS will be the same as rtsp.capture_fps.
+  filename_prefix: "person" # e.g., person_20231027-153000.mp4
+
+archive_maintenance: # Manages the 'person_event_recording.output_directory'
+  enabled: true
+  max_clip_age_days: 7             # Delete clips older than this many days.
+  min_disk_free_gb_threshold: 5    # Minimum free disk space in GB to maintain.
+  cleanup_interval_seconds: 3600   # How often to run cleanup (e.g., 1 hour).
 
 logging:
   level: "INFO" # DEBUG, INFO, WARNING, ERROR
-  directory: "logs" # Relative to project_root or absolute
-  filename: "smart_detector.log"
+  directory: "logs"
+  filename: "person_detector.log"
   rotation_max_bytes: 10485760 # 10MB
-  rotation_backup_count: 5
-
-zeromq:
-  context_io_threads: 1
-  frame_pub_url: "inproc://frames"
-  event_pub_url: "inproc://events"
-  annotated_pub_url: "inproc://annotated"
+  rotation_backup_count: 3
 
 display: # For the cv2.imshow placeholder
   show_window: true
-  window_name: "Smart Detector - Live Feed"
-  fps_display_interval: 1.0 # seconds
+  window_name: "Person Detector - Live Feed"
+  fps_display_interval: 1.0 # seconds, how often to update FPS display
