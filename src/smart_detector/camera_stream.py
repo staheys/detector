@@ -1,32 +1,28 @@
-# detector/src/smart_detector/camera_stream.py
+# src/smart_detector/camera_stream.py
 """
-Модуль для захвата видеопотока с камеры по индексу или RTSP-URL и отображения его в окне
-с разрешением, соответствующим потоку, с обработкой ошибок и возможностью переподключения для RTSP.
+Модуль для захвата видеопотока, распознавания объектов с помощью Ultralytics YOLO
+и отображения результата в окне, размер которого соответствует потоку.
 """
 import cv2
-import logging
-import time
-import os
 import configparser
+import os
+import time
+import logging
 from typing import Union
+from ultralytics import YOLO
 
 def start_camera_stream(
     source: Union[int, str],
+    model: YOLO,
+    conf_threshold: float,
     window_name: str = None,
     reconnect: bool = False,
     reconnect_interval: float = 5.0
 ):
     """
-    Запускает захват видео с камеры (индекс) или RTSP-URL и отображает его в окне
-    с размером, соответствующим разрешению кадра. Поддерживает обработку ошибок
-    и опциональное переподключение.
-
-    :param source: индекс камеры (int) или RTSP-URL (str).
-    :param window_name: пользовательское имя окна (необязательно).
-    :param reconnect: флаг переподключения при обрыве потока (только для RTSP).
-    :param reconnect_interval: время ожидания перед попыткой переподключения (секунды).
+    Запускает захват видео из источника, выполняет детекцию объектов
+    и показывает кадры с наложенными прямоугольниками.
     """
-    # Настройка логирования
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(message)s'
@@ -35,106 +31,119 @@ def start_camera_stream(
     target = f"RTSP-поток '{source}'" if isinstance(source, str) else f"камера индекс {source}"
     logger.info(f"Открываем {target}...")
 
-    # Основной цикл: попытка захвата и отображения
+    # Запуск потока обработки окон (для Windows GUI)
+    cv2.startWindowThread()
+
     while True:
-        cap = cv2.VideoCapture(source)
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             logger.error(f"Не удалось открыть источник: {target}.")
             cap.release()
             if isinstance(source, str) and reconnect:
-                logger.info(f"Переподключение через {reconnect_interval} секунд...")
+                logger.info(f"Переподключение через {reconnect_interval} сек...")
                 time.sleep(reconnect_interval)
                 continue
             raise RuntimeError(f"Не удалось открыть видеоисточник: {source}")
 
-        # Настройка окна по размеру потока
         try:
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            logger.warning("Не удалось установить буфер кадров, используем стандартный.")
+
+        try:
+            width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             if width <= 0 or height <= 0:
                 raise ValueError(f"Недопустимые размеры кадра: {width}x{height}")
 
-            final_window = window_name or f"{source} - {width}x{height}"
-            cv2.namedWindow(final_window, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(final_window, width, height)
+            win_name = window_name or f"{source} - {width}x{height}"
+            # Используем автоподгонку размера окна
+            cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
+            # Один раз прогон для обработки события открытия
+            cv2.waitKey(1)
         except Exception:
             cap.release()
-            logger.exception("Ошибка при настройке окна отображения.")
+            logger.exception("Ошибка при настройке окна.")
             raise
 
-        # Цикл чтения и показа кадров
         try:
             while True:
+                if isinstance(source, str):
+                    # Обнуляем буфер RTSP
+                    while cap.grab():
+                        pass
+
                 ret, frame = cap.read()
                 if not ret or frame is None:
-                    logger.warning("Не удалось получить кадр или кадр пустой.")
+                    logger.warning("Кадр не получен или пустой.")
                     break
 
-                cv2.imshow(final_window, frame)
-                key = cv2.waitKey(1)
-                if key & 0xFF in (ord('q'), 27):
-                    logger.info("Получен сигнал выхода, закрываем поток.")
+                results   = model(frame, conf=conf_threshold)[0]
+                annotated = results.plot()
+
+                cv2.imshow(win_name, annotated)
+                if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+                    logger.info("Сигнал выхода получен, закрываем.")
                     return
         except KeyboardInterrupt:
-            logger.info("Стрим остановлен пользователем.")
+            logger.info("Остановлено пользователем.")
             return
         except Exception:
-            logger.exception("Непредвиденная ошибка во время стрима.")
+            logger.exception("Ошибка во время стрима.")
             raise
         finally:
             cap.release()
-            cv2.destroyWindow(final_window)
+            cv2.destroyWindow(win_name)
 
-        # При необходимости переподключиться (RTSP)
         if isinstance(source, str) and reconnect:
-            logger.info(f"Поток прерван. Переподключение через {reconnect_interval} секунд...")
+            logger.info(f"Поток прерван, переподключение через {reconnect_interval} сек...")
             time.sleep(reconnect_interval)
             continue
         break
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Просмотр видеопотока с камеры или RTSP")
+    parser = argparse.ArgumentParser(description="Stream + YOLO-детекцию")
     parser.add_argument(
         "-c", "--config", type=str,
         default=os.path.join(os.path.dirname(__file__), 'config.ini'),
-        help="Путь к конфигурационному файлу INI"
+        help="Путь к INI-файлу конфигурации"
     )
-    parser.add_argument("-s", "--source", type=str, help="Индекс камеры или RTSP-URL")
-    parser.add_argument("-n", "--name",   type=str, help="Пользовательское название окна")
-    parser.add_argument("-r", "--reconnect", action="store_true", help="Включить переподключение для RTSP")
-    parser.add_argument("-i", "--interval", type=float, help="Интервал переподключения в секундах")
     args = parser.parse_args()
 
-    # Чтение конфигурации из INI
-    config = configparser.ConfigParser()
-    if os.path.exists(args.config):
-        config.read(args.config)
-        if 'stream' in config:
-            sec = config['stream']
-            if not args.source and sec.get('source'):
-                args.source = sec.get('source')
-            if not args.name   and sec.get('name'):
-                args.name = sec.get('name')
-            if not args.reconnect and sec.get('reconnect'):
-                args.reconnect = sec.getboolean('reconnect')
-            if args.interval is None and sec.get('interval'):
-                args.interval = sec.getfloat('interval')
+    cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+    if not os.path.exists(args.config):
+        parser.error(f"Файл конфигурации не найден: {args.config}")
+    cfg.read(args.config)
 
-    if not args.source:
-        parser.error("Необходимо указать источник видео через --source или в файле конфигурации.")
+    # Параметры потока
+    src        = cfg.get('stream', 'source')
+    name       = cfg.get('stream', 'name', fallback=None)
+    reconnect  = cfg.getboolean('stream', 'reconnect', fallback=False)
+    interval   = cfg.getfloat('stream', 'interval', fallback=5.0)
 
-    # Преобразование источника
-    if str(args.source).isdigit():
-        source = int(args.source)
+    # Параметры детекции
+    weights    = cfg.get('detection', 'weights', fallback='yolov8n.pt')
+    device     = cfg.get('detection', 'device', fallback='cpu')
+    conf_thresh= cfg.getfloat('detection', 'confidence', fallback=0.25)
+
+    # Интерпретация источника
+    if src.isdigit():
+        source = int(src)
     else:
-        source = args.source
+        source = src
+
+    # Загрузка модели
+    model = YOLO(weights)
+    model.to(device)
 
     start_camera_stream(
-        source,
-        window_name=args.name,
-        reconnect=args.reconnect,
-        reconnect_interval=args.interval if args.interval is not None else 5.0
+        source=source,
+        model=model,
+        conf_threshold=conf_thresh,
+        window_name=name,
+        reconnect=reconnect,
+        reconnect_interval=interval
     )
 
 if __name__ == "__main__":
