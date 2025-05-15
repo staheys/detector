@@ -1,24 +1,21 @@
 [project]
-name = "smart-detector"
-version = "0.2.0"
-description = "Smart detection system with RTSP, YOLOv9-ONNX, Archiving, and ZeroMQ"
-authors = [{name = "Your Name", email = "you@example.com"}] # Please update
+name = "smart-detector-person"
+version = "0.3.1" # Incremented version
+description = "Person detection and recording system from RTSP/camera"
+authors = [{name = "Your Name", email = "you@example.com"}]
 readme = "README.md"
 requires-python = ">=3.9"
 
 dependencies = [
     "ultralytics>=8.1.0",
-    "opencv-python>=4.10.0", # Use opencv-python-headless for server environments without GUI needs
-    "rich>=13.0.0",
-    "pyzmq>=25.0.0",
+    "opencv-python>=4.10.0",
     "PyYAML>=6.0",
+    "rich>=13.0.0",
     "numpy>=1.20"
-    # "onnxruntime" # Add if you use ONNXRuntime directly and Ultralytics doesn't manage it for you.
-    # "onnxruntime-gpu" # For GPU acceleration with ONNXRuntime.
 ]
 
 [project.scripts]
-smart-detector = "smart_detector.cli:main"
+person-detector = "smart_detector.cli:main"
 
 [build-system]
 requires = ["hatchling"]

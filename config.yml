@@ -1,54 +1,67 @@
-# config.yml (New Version for Person Detection Focus)
-app:
-  project_root: "." # Assumes script runs from project root, or paths are relative to this file
+# config.yml
 
-rtsp:
-  url: "rtsp://admin:qwerty13579@192.168.0.3:554/Streaming/Channels/102" # !!! REPLACE with your RTSP stream or 0 for webcam !!!
-  # url: 0 # For webcam testing
-  capture_resolution_width: 640 # Consider 1280x720 for lighter load
-  capture_resolution_height: 480
-  capture_fps: 15 # Desired capture/processing FPS. Camera should support this.
+app:
+  project_root: "."
+
+# --- Поток 1: Для отображения пользователю и периодического архива (чистый) ---
+stream_display_archive:
+  enabled: true
+  url: "rtsp://admin:qwerty13579@192.168.0.3:554/Streaming/Channels/101" # !!! ЗАМЕНИТЕ !!!
+  # url: 0 # Для теста с веб-камерой как "чистый" поток
+  capture_resolution_width: 1280 # Желаемое разрешение для этого потока
+  capture_resolution_height: 720
+  capture_fps: 25 # Желаемая FPS для этого потока (и для периодического архива)
   reconnect_delay_seconds: 5
 
-inference:
-  model_path: "models/yolov8n.pt" # Path to your ONNX model
-  confidence_threshold: 0.40 # Confidence for detecting a person
-  # Ensure this class ID corresponds to "person" in your ONNX model
-  # For COCO-trained models (like standard YOLO), 'person' is usually class ID 0.
-  person_class_id: 0
-  process_every_nth_frame: 1 # Process 1 out of N frames. 1 = process all.
-  device: "cuda:0" # or "cuda:0" for GPU if ONNXRuntime-GPU & CUDA are set up
-
-person_event_recording:
+# --- Поток 2: Для детекции людей и записи клипов по событию ---
+stream_detection:
   enabled: true
-  # Directory where person-triggered video clips will be saved.
-  # Relative to project_root or absolute.
-  output_directory: "person_clips"
-  # How many seconds of frames to keep in a rolling buffer.
-  # This buffer is used for pre-event recording and to ensure smooth clip transitions.
-  # Should be at least pre_event_seconds + a small margin.
-  frame_buffer_seconds: 8
-  # How many seconds of video to include *before* a person is initially detected.
+  url: "rtsp://admin:qwerty13579@192.168.0.3:554/Streaming/Channels/102" # !!! ЗАМЕНИТЕ !!!
+  # url: 1 # Для теста с другой веб-камерой как "детекторный" поток
+  capture_resolution_width: 640  # Можно использовать меньшее разрешение для детекции
+  capture_resolution_height: 480 # для снижения нагрузки на модель
+  capture_fps: 25 # FPS для детекции может быть ниже, чем для отображения
+  reconnect_delay_seconds: 5
+
+inference: # Настройки для модели, применяются к stream_detection
+  model_path: "models/yolov9-medium.onnx"
+  confidence_threshold: 0.50
+  person_class_id: 0 # Убедитесь, что это ID "person" в вашей модели
+  device: "cpu" # "cuda:0" для GPU
+  process_every_nth_frame: 1 # Обрабатывать каждый N-й кадр из stream_detection для инференса
+  max_person_bbox_area_ratio: 0.85 # Фильтр для слишком больших детекций
+  min_person_bbox_area_ratio: 0.002 # Фильтр для слишком маленьких детекций
+
+person_event_recording: # Настройки для клипов по событию с stream_detection
+  enabled: true
+  output_directory: "person_clips" # Клипы сохраняются сюда
+  frame_buffer_seconds: 8 # Буфер кадров для предзаписи (из stream_detection)
   pre_event_seconds: 3
-  # If no person is detected for this many seconds, the current recording segment ends.
-  post_event_timeout_seconds: 5
-  # Clip FPS will be the same as rtsp.capture_fps.
-  filename_prefix: "person" # e.g., person_20231027-153000.mp4
+  post_event_timeout_seconds: 7 # Таймаут после последнего обнаружения человека
+  filename_prefix: "person_event" # к имени файла добавится .avi и .meta.json
+  draw_detections_on_clips: true # Рисовать ли рамки на клипах по событию
 
-archive_maintenance: # Manages the 'person_event_recording.output_directory'
+periodic_archiving: # Настройки для периодического архива с stream_display_archive
   enabled: true
-  max_clip_age_days: 7             # Delete clips older than this many days.
-  min_disk_free_gb_threshold: 5    # Minimum free disk space in GB to maintain.
-  cleanup_interval_seconds: 3600   # How often to run cleanup (e.g., 1 hour).
+  output_directory: "periodic_archive"
+  segment_duration_minutes: 30
+  filename_prefix: "archive_ch101" # .avi будет добавлено
+
+archive_maintenance:
+  enabled: true
+  directories_to_clean: [] # Автоматически заполняется из output_directory выше
+  max_clip_age_days: 7
+  min_disk_free_gb_threshold: 10
+  cleanup_interval_seconds: 3600
 
 logging:
-  level: "INFO" # DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
   directory: "logs"
-  filename: "person_detector.log"
-  rotation_max_bytes: 10485760 # 10MB
+  filename: "dual_stream_detector.log"
+  rotation_max_bytes: 10485760
   rotation_backup_count: 3
 
-display: # For the cv2.imshow placeholder
+display: # Настройки для окна отображения (показывает stream_display_archive)
   show_window: true
-  window_name: "Person Detector - Live Feed"
-  fps_display_interval: 1.0 # seconds, how often to update FPS display
+  window_name: "Live Feed (Channel 101 - Clean)"
+  fps_display_interval: 1.0 # Как часто обновлять FPS на экране
