@@ -9,17 +9,18 @@ import numpy as np
 from threading import Thread, Event, current_thread as get_current_thread
 import queue
 from datetime import datetime, timedelta
-import json  # For metadata
+import json
 
-from .utils import get_config, get_detection_color
+from .utils import get_detection_color
 from .video_utils import create_video_capture, save_video_segment, draw_detections_on_frame_for_clip
 from . import config_constants as consts
 
 logger = logging.getLogger(__name__)
-_model_instance = None  # Global for YOLO model
+_model_instance = None
 
 
-def _load_model_once(model_path_str: str, device: str):  # Без изменений
+# _load_model_once и _perform_inference остаются без изменений от предыдущей версии
+def _load_model_once(model_path_str: str, device: str):
     global _model_instance
     if _model_instance is None:
         logger.info(f"Loading model from {model_path_str} for device '{device}'")
@@ -35,17 +36,21 @@ def _load_model_once(model_path_str: str, device: str):  # Без изменен
     return _model_instance
 
 
-def _perform_inference(frame: np.ndarray, infer_cfg: dict, frame_dims: tuple[int, int]):  # Без изменений
+def _perform_inference(frame: np.ndarray, infer_cfg: dict, frame_dims: tuple[int, int]):
     model = _model_instance;
     if model is None: return []
+    # Проверяем, что кадр не пустой перед передачей в модель
+    if frame is None or frame.size == 0:
+        logger.warning("Performing inference on an empty or None frame. Skipping.")
+        return []
     results = model.predict(source=frame.copy(), conf=infer_cfg['confidence_threshold'],
                             classes=[infer_cfg['person_class_id']], device=infer_cfg['device'],
                             verbose=False, half=(infer_cfg['device'] != "cpu"))
     detections = []
     if results and results[0].boxes:
         frame_width, frame_height = frame_dims
-        max_r, min_r = infer_cfg.get('max_person_bbox_area_ratio', 0.90), infer_cfg.get('min_person_bbox_area_ratio',
-                                                                                        0.005)
+        max_r = infer_cfg.get('max_person_bbox_area_ratio', 0.90)
+        min_r = infer_cfg.get('min_person_bbox_area_ratio', 0.005)
         for box in results[0].boxes:
             xyxy = box.xyxy[0].cpu().numpy().tolist();
             conf = float(box.conf[0].cpu().numpy());
@@ -59,14 +64,17 @@ def _perform_inference(frame: np.ndarray, infer_cfg: dict, frame_dims: tuple[int
                 b_area = bw * bh;
                 f_area = frame_width * frame_height;
                 ratio = b_area / f_area if f_area > 0 else 0
-                if not (min_r <= ratio <= max_r): logger.info(f"Filter person by area ratio: {ratio:.3f}"); continue
+                if not (min_r <= ratio <= max_r):
+                    logger.debug(
+                        f"Filtering 'person' due to area ratio: {ratio:.3f} (conf: {conf:.2f}). Allowed: [{min_r}-{max_r}].")
+                    continue
                 detections.append({'class_id': cid, 'class_name': cname, 'confidence': conf, 'bbox_xyxy': xyxy,
-                                   'frame_dims': frame_dims})  # Add frame_dims for metadata
+                                   'frame_dims': frame_dims})
     return detections
 
 
+# capture_thread_func остается без изменений от предыдущей версии
 def capture_thread_func(stop_event: Event, frame_queue: queue.Queue, stream_cfg: dict, stream_name: str):
-    """Generic capture thread for a single RTSP stream."""
     ct_name = f"CaptureThread-{stream_name}";
     get_current_thread().name = ct_name
     cap = None;
@@ -76,55 +84,195 @@ def capture_thread_func(stop_event: Event, frame_queue: queue.Queue, stream_cfg:
         'capture_fps']
     reconnect_delay = stream_cfg['reconnect_delay_seconds']
     min_frame_interval = 1.0 / fps if fps > 0 else 0
-
-    logger.info(f"[{ct_name}] Starting for URL: {url}")
-
+    logger.info(f"[{ct_name}] Starting for URL: {url} @ {fps} FPS target")
     while not stop_event.is_set():
         if cap is None or not cap.isOpened():
             logger.info(f"[{ct_name}] Connecting to: {url}")
-            if cap: cap.release()
+            if cap: cap.release(); cap = None
             cap = create_video_capture(url, width, height, fps)
-            if cap is None: logger.error(f"[{ct_name}] Retry in {reconnect_delay}s..."); stop_event.wait(
+            if cap is None: logger.error(f"[{ct_name}] Failed. Retry in {reconnect_delay}s..."); stop_event.wait(
                 reconnect_delay); continue
-            logger.info(f"[{ct_name}] Connected.");
+            logger.info(f"[{ct_name}] Connected to {url}.");
             frame_counter = 0
-
         loop_start_time = time.perf_counter()
         ret, frame = cap.read()
-        if not ret or frame is None:
-            logger.warning(f"[{ct_name}] No frame from {url}. Reconnecting...");
-            if cap: cap.release(); cap = None; stop_event.wait(reconnect_delay); continue
-
+        if not ret or frame is None:  # Добавим проверку frame is None здесь
+            logger.warning(
+                f"[{ct_name}] No frame from {url} (ret={ret}, frame is None={frame is None}). Reconnecting...");
+            if cap: cap.release(); cap = None; stop_event.wait(reconnect_delay); continue  # Используем reconnect_delay
         timestamp = time.time()
         try:
             frame_id = f"{stream_name}_f_{timestamp:.3f}_{frame_counter}"
-            # For detection stream, we might add empty 'detections_for_clip'
-            # For display stream, this field is not strictly needed but harmless
-            item_to_queue = {'timestamp': timestamp, 'id': frame_id, 'frame': frame.copy(),
+            item_to_queue = {'timestamp': timestamp, 'id': frame_id, 'frame': frame.copy(),  # Копируем кадр
                              'raw_frame_counter': frame_counter, 'stream_name': stream_name,
-                             'detections_for_clip': [] if stream_name == "detection" else None}
+                             'detections_for_clip': []}
             frame_queue.put(item_to_queue, timeout=0.5)
             logger.debug(f"[{ct_name}] Queued frame {frame_id} (raw_seq: {frame_counter})")
             frame_counter += 1
         except queue.Full:
             logger.warning(f"[{ct_name}] Frame queue full for {stream_name}. Frame {frame_id} dropped.")
-
         elapsed_time = time.perf_counter() - loop_start_time
         if min_frame_interval > 0:
             sleep_duration = min_frame_interval - elapsed_time
             if sleep_duration > 0: stop_event.wait(sleep_duration)
-
     logger.info(f"[{ct_name}] Stopping for {url}.");
     if cap: cap.release()
     try:
-        frame_queue.put_nowait(None)  # Sentinel
+        frame_queue.put_nowait(None)
     except queue.Full:
-        logger.warning(f"[{ct_name}] Could not put sentinel on full queue for {stream_name}.")
+        logger.warning(f"[{ct_name}] Could not put sentinel on full queue for {stream_name} during shutdown.")
+
+
+def display_thread_func(stop_event: Event, display_frame_queue: queue.Queue, display_cfg: dict, app_cfg: dict):
+    get_current_thread().name = "DisplayThread"
+    window_name = display_cfg.get('window_name', "Live Feed (Clean)")
+    logger.info(f"[DisplayThread] Started. Window: '{window_name}'")
+    fps_calc_frames = 0;
+    fps_calc_last_time = time.perf_counter();
+    displayed_fps_val = 0.0
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    except Exception as e:
+        logger.error(f"[DisplayThread] Failed to create OpenCV window: {e}"); return
+
+    while not stop_event.is_set():
+        try:
+            frame_data = display_frame_queue.get(timeout=0.05)
+            if frame_data is None: logger.info("[DisplayThread] Received sentinel. Stopping."); break
+
+            raw_frame_to_display = frame_data['frame']
+            # ИСПРАВЛЕНИЕ: Проверка, что кадр не None и не пустой
+            if raw_frame_to_display is None or raw_frame_to_display.size == 0:
+                logger.debug("[DisplayThread] Received invalid frame for display (None or empty).")
+                time.sleep(0.01);
+                continue
+
+            display_overlay_frame = raw_frame_to_display.copy()
+            fps_calc_frames += 1;
+            loop_time = time.perf_counter()
+            if loop_time - fps_calc_last_time >= display_cfg['fps_display_interval']:
+                if (loop_time - fps_calc_last_time) > 0: displayed_fps_val = fps_calc_frames / (
+                            loop_time - fps_calc_last_time)
+                fps_calc_frames = 0;
+                fps_calc_last_time = loop_time
+            cv2.putText(display_overlay_frame, f"FPS: {displayed_fps_val:.1f} (Disp)", consts.INFO_TEXT_POSITION,
+                        consts.CV2_FONT, consts.CV2_FONT_SCALE_INFO, consts.CV2_COLOR_FPS, consts.CV2_FONT_THICKNESS)
+
+            runtime_state = app_cfg.get('runtime_state', {})
+            if runtime_state.get('is_person_event_active', False):
+                cv2.putText(display_overlay_frame, "REC (Person Ch102)", consts.RECORDING_INDICATOR_POSITION,
+                            consts.CV2_FONT, consts.CV2_FONT_SCALE_INFO, consts.CV2_COLOR_RECORDING_INDICATOR, 2)
+            if runtime_state.get('is_periodic_archiving_active', False):
+                cv2.putText(display_overlay_frame, "REC (Archive Ch101)", consts.ARCHIVE_INDICATOR_POSITION,
+                            consts.CV2_FONT, consts.CV2_FONT_SCALE_INFO, consts.CV2_COLOR_ARCHIVE_INDICATOR, 2)
+
+            cv2.imshow(window_name, display_overlay_frame)
+            key = cv2.waitKey(1)
+            if key != -1 and (key & 0xFF == ord('q') or key == 27):  # q или Esc
+                logger.info("[DisplayThread] 'q' or ESC pressed. Signaling global shutdown.")
+                stop_event.set();
+                break
+        except queue.Empty:
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                logger.info("[DisplayThread] Window closed by user. Signaling global shutdown.")
+                stop_event.set();
+                break
+            key_check = cv2.waitKey(1)
+            if key_check != -1 and (key_check & 0xFF == ord('q') or key_check == 27): stop_event.set(); break
+            continue
+        except cv2.error as e_cv:
+            if "NULL window" in str(e_cv) or "Invalid window handle" in str(e_cv):
+                logger.warning("[DisplayThread] OpenCV window closed externally."); break
+            else:
+                logger.error(f"[DisplayThread] OpenCV display error: {e_cv}", exc_info=True); break
+        except Exception as e:
+            logger.error(f"[DisplayThread] Unexpected error: {e}", exc_info=True); break
+    logger.info("[DisplayThread] Stopping.");
+    try:
+        cv2.destroyWindow(window_name)
+    except Exception:
+        pass
+
+
+# Вспомогательные функции для финализации клипов
+def _finalize_person_clip(reason, event_record_cfg, person_event_output_dir, detection_stream_fps,
+                          person_clip_frames_to_write_ref, person_clip_start_ts, is_person_event_active_state_ref):
+    # is_person_event_active_state_ref - это список [is_active_bool]
+    # person_clip_frames_to_write_ref - это сам список person_clip_frames_to_write
+    if not person_clip_frames_to_write_ref:  # Проверяем, есть ли кадры
+        logger.info(
+            f"Person event ({reason}). No frames to write for clip from {datetime.fromtimestamp(person_clip_start_ts).isoformat()}.")
+        is_person_event_active_state_ref[0] = False  # Сбрасываем флаг
+        return
+
+    logger.info(
+        f"Person event ({reason}). Finalizing clip from {datetime.fromtimestamp(person_clip_start_ts).isoformat()}. Frames: {len(person_clip_frames_to_write_ref)}")
+    clip_filename_base = f"{event_record_cfg['filename_prefix']}_{datetime.fromtimestamp(person_clip_start_ts).strftime('%Y%m%d-%H%M%S%f')[:-3]}"
+    clip_filepath_base = person_event_output_dir / clip_filename_base
+
+    # ИСПРАВЛЕНИЕ ValueError: Проверяем, что first_f не None перед использованием
+    first_f = next((f for f in person_clip_frames_to_write_ref if f is not None and f.size > 0),
+                   None)  # Добавил f.size > 0
+    if first_f is not None:  # Явная проверка на None
+        fh_ev, fw_ev = first_f.shape[:2]
+        if save_video_segment(person_clip_frames_to_write_ref, clip_filepath_base, detection_stream_fps,
+                              (fw_ev, fh_ev)):
+            meta_data = {"event_start_timestamp": person_clip_start_ts,
+                         "event_start_iso": datetime.fromtimestamp(person_clip_start_ts).isoformat(),
+                         "video_filename": clip_filepath_base.with_suffix('.avi').name,
+                         "source_stream_config": "stream_detection",
+                         "total_frames": len(person_clip_frames_to_write_ref),
+                         "reason_for_finalize": reason}
+            meta_filepath = clip_filepath_base.with_suffix('.meta.json')
+            try:
+                with open(meta_filepath, 'w') as f_meta:
+                    json.dump(meta_data, f_meta, indent=2)
+                logger.info(f"Saved metadata: {meta_filepath}")
+            except Exception as e_meta:
+                logger.error(f"Failed to save metadata {meta_filepath}: {e_meta}")
+    else:
+        logger.warning(
+            f"Could not finalize person clip for event at {datetime.fromtimestamp(person_clip_start_ts).isoformat()}: No valid frames found in buffer.")
+
+    person_clip_frames_to_write_ref.clear()
+    is_person_event_active_state_ref[0] = False  # Обновляем состояние через ссылку
+
+
+def _finalize_periodic_clip(reason, periodic_record_cfg, periodic_output_dir, periodic_fps,
+                            periodic_segment_raw_frames_ref, periodic_segment_start_ts_frame,
+                            periodic_segment_start_time_wc_state_ref):
+    # periodic_segment_start_time_wc_state_ref - это список [wc_time, frame_ts]
+    # periodic_segment_raw_frames_ref - это сам список periodic_segment_raw_frames
+    if not periodic_segment_raw_frames_ref:
+        logger.info(
+            f"Periodic archive ({reason}). No frames to write for segment from {datetime.fromtimestamp(periodic_segment_start_ts_frame).isoformat()}.")
+        # Сбрасываем время начала следующего сегмента, даже если этот был пуст
+        periodic_segment_start_time_wc_state_ref[0] = time.time()
+        periodic_segment_start_time_wc_state_ref[1] = 0
+        return
+
+    logger.info(
+        f"Periodic archive ({reason}). Finalizing segment from {datetime.fromtimestamp(periodic_segment_start_ts_frame).isoformat()}. Frames: {len(periodic_segment_raw_frames_ref)}")
+
+    # ИСПРАВЛЕНИЕ ValueError:
+    first_f = next((f for f in periodic_segment_raw_frames_ref if f is not None and f.size > 0),
+                   None)  # Добавил f.size > 0
+    if first_f is not None:  # Явная проверка
+        fh, fw = first_f.shape[:2]
+        save_video_segment(periodic_segment_raw_frames_ref,
+                           periodic_output_dir / f"{periodic_record_cfg['filename_prefix']}_{datetime.fromtimestamp(periodic_segment_start_ts_frame).strftime('%Y%m%d-%H%M%S%f')[:-3]}",
+                           periodic_fps, (fw, fh))
+    else:
+        logger.warning(
+            f"Could not finalize periodic clip from {datetime.fromtimestamp(periodic_segment_start_ts_frame).isoformat()}: No valid frames.")
+
+    periodic_segment_raw_frames_ref.clear()
+    periodic_segment_start_time_wc_state_ref[0] = time.time()
+    periodic_segment_start_time_wc_state_ref[1] = 0
 
 
 def run_application_logic(stop_event: Event, cfg: dict):
     get_current_thread().name = "MainAppLogicThread"
-    # Config sections
     cfg_s_display_archive = cfg.get('stream_display_archive', {})
     cfg_s_detection = cfg.get('stream_detection', {})
     infer_cfg = cfg['inference']
@@ -132,319 +280,211 @@ def run_application_logic(stop_event: Event, cfg: dict):
     periodic_record_cfg = cfg.get('periodic_archiving', {})
     display_cfg = cfg['display']
 
-    # Load model if detection stream is enabled
+    cfg['runtime_state'] = {'is_person_event_active': False, 'is_periodic_archiving_active': False}
+
     if cfg_s_detection.get('enabled', False) and event_record_cfg.get('enabled', False):
         try:
             _load_model_once(str(infer_cfg['model_path']), infer_cfg['device'])
         except Exception as e:
             logger.critical(f"Model load fail: {e}."); stop_event.set(); return
 
-    # Queues and Threads for each stream
-    display_archive_queue = None
-    detection_queue = None
-    capture_threads = []
+    display_archive_queue = None;
+    detection_queue = None;
+    display_feed_queue = None
+    capture_threads = [];
+    other_threads = []
 
     if cfg_s_display_archive.get('enabled', False):
-        queue_cap = int(cfg_s_display_archive['capture_fps'] * 10)  # ~10s buffer
-        display_archive_queue = queue.Queue(maxsize=queue_cap)
-        t_disp = Thread(target=capture_thread_func,
-                        args=(stop_event, display_archive_queue, cfg_s_display_archive, "display_archive"),
-                        daemon=True)
-        capture_threads.append(t_disp)
+        fps_da = cfg_s_display_archive.get('capture_fps', 15)
+        display_archive_queue = queue.Queue(maxsize=int(fps_da * 5))
+        display_feed_queue = queue.Queue(maxsize=int(fps_da * 2))
+        t_disp_cap = Thread(target=capture_thread_func,
+                            args=(stop_event, display_archive_queue, cfg_s_display_archive, "display_archive"),
+                            daemon=True, name="CaptureThread-DisplayArchive")
+        capture_threads.append(t_disp_cap)
+        if display_cfg.get('show_window', False):
+            t_display_feed = Thread(target=display_thread_func, args=(stop_event, display_feed_queue, display_cfg, cfg),
+                                    daemon=True, name="DisplayFeedThread")
+            other_threads.append(t_display_feed)
 
     if cfg_s_detection.get('enabled', False):
-        queue_cap = int(cfg_s_detection['capture_fps'] * (event_record_cfg.get('frame_buffer_seconds', 8) + 5))
-        detection_queue = queue.Queue(maxsize=queue_cap)
-        t_det = Thread(target=capture_thread_func,
-                       args=(stop_event, detection_queue, cfg_s_detection, "detection"),
-                       daemon=True)
-        capture_threads.append(t_det)
+        fps_dt = cfg_s_detection.get('capture_fps', 10)
+        buffer_s = event_record_cfg.get('frame_buffer_seconds', 8)
+        detection_queue = queue.Queue(maxsize=int(fps_dt * (buffer_s + 2)))  # Уменьшил немного буфер
+        t_det_cap = Thread(target=capture_thread_func, args=(stop_event, detection_queue, cfg_s_detection, "detection"),
+                           daemon=True, name="CaptureThread-Detection")
+        capture_threads.append(t_det_cap)
 
     for t in capture_threads: t.start()
+    for t in other_threads: t.start()
 
-    # --- State for Display and Periodic Archive (from display_archive_queue) ---
-    vis_frame_for_display = None  # Latest clean frame for user display
     periodic_enabled = periodic_record_cfg.get('enabled', False) and cfg_s_display_archive.get('enabled', False)
-    periodic_segment_raw_frames = []
-    periodic_segment_start_time_wc = time.time()
-    periodic_segment_start_ts_frame = 0
+    periodic_segment_raw_frames = [];
+    _periodic_segment_start_time_wc_state = [time.time(), 0]  # [wall_clock_start, first_frame_timestamp]
     periodic_output_dir = Path(periodic_record_cfg.get('output_directory', 'periodic_archive'))
     periodic_segment_duration_sec = periodic_record_cfg.get('segment_duration_minutes', 30) * 60
     periodic_fps = cfg_s_display_archive.get('capture_fps', 15)
 
-    # --- State for Person Event Recording (from detection_queue) ---
     event_rec_enabled = event_record_cfg.get('enabled', False) and cfg_s_detection.get('enabled', False)
-    person_buffer_maxlen = int(cfg_s_detection['capture_fps'] * event_record_cfg.get('frame_buffer_seconds', 8))
-    person_recent_frames_buffer = deque(
-        maxlen=person_buffer_maxlen)  # Stores {'ts', 'id', 'frame', 'detections_for_clip'} from detection stream
-    is_person_event_active = False;
+    person_buffer_maxlen = int(cfg_s_detection.get('capture_fps', 10) * event_record_cfg.get('frame_buffer_seconds', 8))
+    person_recent_frames_buffer = deque(maxlen=person_buffer_maxlen)
+    _is_person_event_active_state = [False]  # Используем список для передачи по ссылке в lambda/finalize
     last_person_seen_time = 0
-    person_clip_frames_to_write = [];
+    person_clip_frames_to_write = []  # Будет содержать кадры с нарисованными рамками
     person_clip_start_ts = 0
     person_event_output_dir = Path(event_record_cfg['output_directory'])
     draw_boxes_on_person_clips = event_record_cfg.get('draw_detections_on_clips', True)
     detection_stream_fps = cfg_s_detection.get('capture_fps', 10)
 
-    # --- General ---
-    fps_display_calc_frames = 0;
-    fps_display_calc_last_time = time.perf_counter();
-    displayed_fps_val = 0.0
-    detection_stream_raw_frame_counter = 0  # For Nth frame logic on detection stream
+    _finalize_person_clip_func = lambda reason: _finalize_person_clip(reason, event_record_cfg, person_event_output_dir,
+                                                                      detection_stream_fps, person_clip_frames_to_write,
+                                                                      person_clip_start_ts,
+                                                                      _is_person_event_active_state)
+    _finalize_periodic_clip_func = lambda reason: _finalize_periodic_clip(reason, periodic_record_cfg,
+                                                                          periodic_output_dir, periodic_fps,
+                                                                          periodic_segment_raw_frames,
+                                                                          _periodic_segment_start_time_wc_state[1],
+                                                                          _periodic_segment_start_time_wc_state)
 
     try:
         while not stop_event.is_set():
-            processed_display_frame = False
-            processed_detection_frame = False
+            processed_disp_f_cycle = False;
+            processed_det_f_cycle = False
 
-            # --- Process Display/Archive Stream ---
             if display_archive_queue:
                 try:
-                    display_data = display_archive_queue.get_nowait()  # Non-blocking
-                    if display_data is None:  # Sentinel for this queue
-                        logger.info("Display/Archive capture thread signaled stop.");
-                        display_archive_queue = None  # Stop trying
+                    display_data = display_archive_queue.get(timeout=0.005)  # Очень короткий таймаут
+                    if display_data is None:
+                        display_archive_queue = None; logger.info("Display/Archive capture source stopped.")
                     else:
-                        vis_frame_for_display = display_data['frame']  # Update display frame
-                        processed_display_frame = True
+                        processed_disp_f_cycle = True
+                        if display_feed_queue and display_cfg.get('show_window'):
+                            try:
+                                display_feed_queue.put_nowait(display_data)
+                            except queue.Full:
+                                logger.debug("[MainLogic] Display feed queue full.")  # Debug, т.к. может быть часто
 
-                        # Periodic Archival (uses raw frames from display_data['frame'])
                         if periodic_enabled:
-                            if not periodic_segment_raw_frames:
-                                periodic_segment_start_ts_frame = display_data['timestamp']
-                                periodic_segment_start_time_wc = time.time()
+                            if not periodic_segment_raw_frames:  # Start new segment
+                                _periodic_segment_start_time_wc_state[1] = display_data['timestamp']  # first_frame_ts
+                                _periodic_segment_start_time_wc_state[0] = time.time()  # wall_clock_start
                                 logger.info(
-                                    f"Starting new periodic archive from Ch101 @ {datetime.fromtimestamp(display_data['timestamp']).isoformat()}")
+                                    f"Starting new periodic archive (Ch101) from {datetime.fromtimestamp(display_data['timestamp']).isoformat()}.")
+                                cfg['runtime_state']['is_periodic_archiving_active'] = True
                             periodic_segment_raw_frames.append(display_data['frame'].copy())
-
-                            if time.time() - periodic_segment_start_time_wc >= periodic_segment_duration_sec:
-                                logger.info(
-                                    f"Periodic archive (Ch101) segment due. Finalizing from {datetime.fromtimestamp(periodic_segment_start_ts_frame).isoformat()}.")
-                                first_f = next((f for f in periodic_segment_raw_frames if f is not None), None)
-                                if first_f: fh, fw = first_f.shape[:2]; save_video_segment(periodic_segment_raw_frames,
-                                                                                           periodic_output_dir / f"{periodic_record_cfg['filename_prefix']}_{datetime.fromtimestamp(periodic_segment_start_ts_frame).strftime('%Y%m%d-%H%M%S%f')[:-3]}",
-                                                                                           periodic_fps, (fw, fh))
-                                periodic_segment_raw_frames.clear()
+                            if time.time() - _periodic_segment_start_time_wc_state[0] >= periodic_segment_duration_sec:
+                                _finalize_periodic_clip_func("duration_met")
+                                cfg['runtime_state']['is_periodic_archiving_active'] = False
                 except queue.Empty:
-                    pass  # No new frame for display/archive stream
+                    pass
 
-            # --- Process Detection Stream ---
             if detection_queue:
                 try:
-                    detect_data = detection_queue.get_nowait()  # Non-blocking
-                    if detect_data is None:  # Sentinel
-                        logger.info("Detection capture thread signaled stop.");
-                        detection_queue = None  # Stop trying
+                    detect_data = detection_queue.get(timeout=0.005)  # Очень короткий таймаут
+                    if detect_data is None:
+                        detection_queue = None; logger.info("Detection capture source stopped.")
                     else:
-                        processed_detection_frame = True
-                        timestamp = detect_data['timestamp'];
-                        frame_id = detect_data['id']
-                        raw_frame_det_stream = detect_data['frame']
-                        raw_capture_seq = detect_data['raw_frame_counter']
-                        # detections_for_clip is initially empty from capture thread
-                        # Will be filled by inference if it runs
-
-                        if raw_frame_det_stream is None or raw_frame_det_stream.shape[0] == 0:
-                            logger.warning(f"Invalid frame {frame_id} from detection queue.");
-                            continue
-
-                        fh_det, fw_det = raw_frame_det_stream.shape[:2]
-                        current_buffer_item = {'timestamp': timestamp, 'id': frame_id, 'frame': raw_frame_det_stream,
+                        processed_det_f_cycle = True
+                        ts, fid, raw_f_det, raw_seq = detect_data['timestamp'], detect_data['id'], detect_data['frame'], \
+                        detect_data['raw_frame_counter']
+                        if raw_f_det is None or raw_f_det.size == 0: logger.warning(
+                            f"Invalid frame {fid} from det_q."); continue  # Проверка .size
+                        fh_det, fw_det = raw_f_det.shape[:2]
+                        current_buffer_item = {'timestamp': ts, 'id': fid, 'frame': raw_f_det,
                                                'detections_for_clip': []}
                         if event_rec_enabled: person_recent_frames_buffer.append(current_buffer_item)
 
-                        detections_this_cycle = []
-                        run_inference = (raw_capture_seq % infer_cfg['process_every_nth_frame'] == 0)
-                        if run_inference and event_rec_enabled:  # Only run inference if event recording is on
-                            inf_start = time.perf_counter()
-                            detections_this_cycle = _perform_inference(raw_frame_det_stream, infer_cfg,
-                                                                       (fw_det, fh_det))
+                        dets_this_cycle = []
+                        if (raw_seq % infer_cfg['process_every_nth_frame'] == 0) and event_rec_enabled:
+                            inf_s = time.perf_counter()
+                            dets_this_cycle = _perform_inference(raw_f_det, infer_cfg, (fw_det, fh_det))
                             logger.debug(
-                                f"DetStream Inf {frame_id} (seq:{raw_capture_seq}) {(time.perf_counter() - inf_start) * 1000:.1f}ms. Found {len(detections_this_cycle)} persons.")
-                            if person_recent_frames_buffer and person_recent_frames_buffer[-1]['id'] == frame_id:
-                                person_recent_frames_buffer[-1]['detections_for_clip'] = detections_this_cycle
+                                f"DetStream Inf {fid}(seq:{raw_seq}) {(time.perf_counter() - inf_s) * 1000:.1f}ms. Found {len(dets_this_cycle)}p.")
+                            if event_rec_enabled and person_recent_frames_buffer and person_recent_frames_buffer[-1][
+                                'id'] == fid:
+                                person_recent_frames_buffer[-1]['detections_for_clip'] = dets_this_cycle
 
-                        person_in_inference = any(
-                            d['class_id'] == infer_cfg['person_class_id'] for d in detections_this_cycle)
-
+                        person_in_inf = any(d['class_id'] == infer_cfg['person_class_id'] for d in dets_this_cycle)
                         if event_rec_enabled:
-                            if person_in_inference:
+                            if person_in_inf:
                                 last_person_seen_time = time.time()
-                                if not is_person_event_active:
-                                    is_person_event_active = True;
-                                    actual_clip_start_ts = timestamp
-                                    temp_clip_frames = []
-                                    pre_event_ts_target = timestamp - event_record_cfg['pre_event_seconds']
-                                    for item_data in list(person_recent_frames_buffer):
-                                        if item_data['timestamp'] >= pre_event_ts_target and item_data[
-                                            'timestamp'] <= timestamp:
-                                            frame_c = item_data['frame']
-                                            dets_c = item_data.get('detections_for_clip', [])
-                                            if draw_boxes_on_person_clips and dets_c:
-                                                frame_c = draw_detections_on_frame_for_clip(frame_c, dets_c, infer_cfg[
-                                                    'person_class_id'], get_detection_color)
-                                            temp_clip_frames.append(frame_c)
-                                            if item_data['timestamp'] < actual_clip_start_ts: actual_clip_start_ts = \
-                                            item_data['timestamp']
-                                    if not temp_clip_frames:  # Fallback
-                                        f_add = raw_frame_det_stream;
-                                        if draw_boxes_on_person_clips and detections_this_cycle: f_add = draw_detections_on_frame_for_clip(
-                                            f_add, detections_this_cycle, infer_cfg['person_class_id'],
-                                            get_detection_color)
-                                        temp_clip_frames.append(f_add)
-                                    person_clip_frames_to_write.extend(temp_clip_frames);
+                                if not _is_person_event_active_state[0]:  # Если событие неактивно
+                                    _is_person_event_active_state[0] = True;
+                                    cfg['runtime_state']['is_person_event_active'] = True
+                                    actual_clip_start_ts = ts
+                                    temp_clip_f = []
+                                    pre_event_target = ts - event_record_cfg['pre_event_seconds']
+                                    for item_d in list(person_recent_frames_buffer):
+                                        if item_d['timestamp'] >= pre_event_target and item_d['timestamp'] <= ts:
+                                            f_c = item_d['frame'];
+                                            dets_c = item_d.get('detections_for_clip', [])
+                                            if draw_boxes_on_person_clips and dets_c: f_c = draw_detections_on_frame_for_clip(
+                                                f_c, dets_c, infer_cfg['person_class_id'], get_detection_color)
+                                            temp_clip_f.append(f_c)
+                                            if item_d['timestamp'] < actual_clip_start_ts: actual_clip_start_ts = \
+                                            item_d['timestamp']
+                                    if not temp_clip_f:
+                                        f_add = raw_f_det.copy();  # Копируем, чтобы не изменить оригинал в буфере
+                                        if draw_boxes_on_person_clips and dets_this_cycle: f_add = draw_detections_on_frame_for_clip(
+                                            f_add, dets_this_cycle, infer_cfg['person_class_id'], get_detection_color)
+                                        temp_clip_f.append(f_add)
+                                    person_clip_frames_to_write.extend(temp_clip_f);
                                     person_clip_start_ts = actual_clip_start_ts
                                     logger.info(
-                                        f"Person event started (Ch102) for {frame_id}. Clip starts ~{datetime.fromtimestamp(person_clip_start_ts).isoformat()}. Added {len(temp_clip_frames)} pre-roll.")
+                                        f"Person event (Ch102) for {fid}. Clip starts ~{datetime.fromtimestamp(person_clip_start_ts).isoformat()}. Added {len(temp_clip_f)} pre-roll.")
 
-                            if is_person_event_active:  # Add current (possibly annotated) frame to active clip
-                                f_add_active = raw_frame_det_stream
-                                if draw_boxes_on_person_clips and detections_this_cycle:
-                                    f_add_active = draw_detections_on_frame_for_clip(f_add_active,
-                                                                                     detections_this_cycle,
-                                                                                     infer_cfg['person_class_id'],
-                                                                                     get_detection_color)
+                            if _is_person_event_active_state[0]:
+                                f_add_active = raw_f_det.copy()  # Копируем
+                                if draw_boxes_on_person_clips and dets_this_cycle: f_add_active = draw_detections_on_frame_for_clip(
+                                    f_add_active, dets_this_cycle, infer_cfg['person_class_id'], get_detection_color)
                                 if not person_clip_frames_to_write or not np.array_equal(
-                                        person_clip_frames_to_write[-1], f_add_active):
-                                    person_clip_frames_to_write.append(f_add_active)
+                                    person_clip_frames_to_write[-1], f_add_active): person_clip_frames_to_write.append(
+                                    f_add_active)
 
-                            if is_person_event_active and not person_in_inference and \
-                                    (time.time() - last_person_seen_time > event_record_cfg[
-                                        'post_event_timeout_seconds']):
-                                logger.info(
-                                    f"Person event timeout (Ch102). Finalizing clip from {datetime.fromtimestamp(person_clip_start_ts).isoformat()}.")
-                                if person_clip_frames_to_write:
-                                    # Save AVI
-                                    clip_filename_base = f"{event_record_cfg['filename_prefix']}_{datetime.fromtimestamp(person_clip_start_ts).strftime('%Y%m%d-%H%M%S%f')[:-3]}"
-                                    clip_filepath_base = person_event_output_dir / clip_filename_base
-
-                                    first_f = next((f for f in person_clip_frames_to_write if f is not None), None)
-                                    if first_f:
-                                        fh_ev, fw_ev = first_f.shape[:2]
-                                        save_video_segment(person_clip_frames_to_write, clip_filepath_base,
-                                                           detection_stream_fps, (fw_ev, fh_ev))
-                                        # Save Metadata
-                                        meta_data_to_save = {
-                                            "event_start_timestamp": person_clip_start_ts,
-                                            "event_start_iso": datetime.fromtimestamp(person_clip_start_ts).isoformat(),
-                                            "video_filename": clip_filepath_base.with_suffix('.avi').name,
-                                            "source_stream_config": "stream_detection",  # Indicate source
-                                            "total_frames": len(person_clip_frames_to_write),
-                                            # Could add first/last detection details if needed
-                                        }
-                                        meta_filepath = clip_filepath_base.with_suffix('.meta.json')
-                                        try:
-                                            with open(meta_filepath, 'w') as f_meta:
-                                                json.dump(meta_data_to_save, f_meta, indent=2)
-                                            logger.info(f"Saved metadata: {meta_filepath}")
-                                        except Exception as e_meta:
-                                            logger.error(f"Failed to save metadata {meta_filepath}: {e_meta}")
-                                person_clip_frames_to_write.clear();
-                                is_person_event_active = False
+                            if _is_person_event_active_state[0] and not person_in_inf and (
+                                    time.time() - last_person_seen_time > event_record_cfg[
+                                'post_event_timeout_seconds']):
+                                _finalize_person_clip_func("timeout")
+                                cfg['runtime_state']['is_person_event_active'] = False  # Обновляем состояние
                 except queue.Empty:
-                    pass  # No new frame for detection stream
+                    pass
 
-            # --- Combined Timeout Finalization (if queues become None due to thread stop) ---
-            if display_archive_queue is None and periodic_enabled and periodic_segment_raw_frames:  # Display stream stopped
-                logger.info("Display stream ended. Finalizing pending periodic archive.")
-                # ... (save periodic segment logic) ...
-                first_f = next((f for f in periodic_segment_raw_frames if f is not None), None);
-                if first_f: fh, fw = first_f.shape[:2]; save_video_segment(periodic_segment_raw_frames,
-                                                                           periodic_output_dir / f"{periodic_record_cfg['filename_prefix']}_force_end_{datetime.fromtimestamp(periodic_segment_start_ts_frame).strftime('%Y%m%d-%H%M%S%f')[:-3]}",
-                                                                           periodic_fps, (fw, fh))
-                periodic_segment_raw_frames.clear()
+            if not processed_det_f_cycle and event_rec_enabled and _is_person_event_active_state[0] and \
+                    (time.time() - last_person_seen_time > event_record_cfg['post_event_timeout_seconds']):
+                _finalize_person_clip_func("timeout_no_new_detection_frames")
+                cfg['runtime_state']['is_person_event_active'] = False
 
-            if detection_queue is None and event_rec_enabled and is_person_event_active and person_clip_frames_to_write:  # Detection stream stopped
-                logger.info("Detection stream ended. Finalizing pending person event clip.")
-                # ... (save person event clip logic with metadata) ...
-                clip_fn_base = f"{event_record_cfg['filename_prefix']}_force_end_{datetime.fromtimestamp(person_clip_start_ts).strftime('%Y%m%d-%H%M%S%f')[:-3]}"
-                clip_fp_base = person_event_output_dir / clip_fn_base
-                first_f = next((f for f in person_clip_frames_to_write if f is not None), None);
-                if first_f: fh, fw = first_f.shape[:2]; save_video_segment(person_clip_frames_to_write, clip_fp_base,
-                                                                           detection_stream_fps, (fw, fh))  # Save AVI
-                # ... (save metadata)
-                meta_fp = clip_fp_base.with_suffix('.meta.json')
-                # ... (json.dump as above) ...
-                person_clip_frames_to_write.clear()
+            if not processed_disp_f_cycle and periodic_enabled and periodic_segment_raw_frames and \
+                    (time.time() - _periodic_segment_start_time_wc_state[0] >= periodic_segment_duration_sec):
+                _finalize_periodic_clip_func("duration_no_new_display_frames")
+                cfg['runtime_state']['is_periodic_archiving_active'] = False
 
-            # --- Display Update (shows clean vis_frame_for_display from display_archive_queue) ---
-            if display_cfg['show_window'] and vis_frame_for_display is not None:
-                fps_display_calc_frames += 1;
-                loop_time = time.perf_counter()
-                if loop_time - fps_display_calc_last_time >= display_cfg['fps_display_interval']:
-                    if (loop_time - fps_display_calc_last_time) > 0: displayed_fps_val = fps_display_calc_frames / (
-                                loop_time - fps_display_calc_last_time)
-                    fps_display_calc_frames = 0;
-                    fps_display_calc_last_time = loop_time
+            if not processed_disp_f_cycle and not processed_det_f_cycle: time.sleep(0.001)  # Уменьшил паузу
 
-                display_overlay_frame = vis_frame_for_display.copy()
-                cv2.putText(display_overlay_frame, f"FPS: {displayed_fps_val:.1f} (Disp)", consts.INFO_TEXT_POSITION,
-                            consts.CV2_FONT, consts.CV2_FONT_SCALE_INFO, consts.CV2_COLOR_FPS,
-                            consts.CV2_FONT_THICKNESS)
-                if is_person_event_active and event_rec_enabled:
-                    cv2.putText(display_overlay_frame, "REC (Person Ch102)", consts.RECORDING_INDICATOR_POSITION,
-                                consts.CV2_FONT, consts.CV2_FONT_SCALE_INFO, consts.CV2_COLOR_RECORDING_INDICATOR, 2)
-                if periodic_enabled and periodic_segment_raw_frames:  # Check if frames are being collected for periodic
-                    cv2.putText(display_overlay_frame, "REC (Archive Ch101)", consts.ARCHIVE_INDICATOR_POSITION,
-                                consts.CV2_FONT, consts.CV2_FONT_SCALE_INFO, consts.CV2_COLOR_ARCHIVE_INDICATOR, 2)
-                try:
-                    cv2.imshow(display_cfg['window_name'], display_overlay_frame)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'): stop_event.set(); break
-                except cv2.error as e:
-                    if "NULL window" in str(e):
-                        logger.warning("OpenCV window closed."); display_cfg['show_window'] = False
-                    else:
-                        logger.error(f"OpenCV display error: {e}"); stop_event.set(); break
-
-            # If no frames processed from either queue, sleep briefly to prevent busy-looping 100% CPU
-            if not processed_display_frame and not processed_detection_frame:
-                time.sleep(0.005)  # 5ms sleep
-
-            # Check if both capture threads have finished (queues became None)
-            if display_archive_queue is None and detection_queue is None and not stop_event.is_set():
-                logger.info("All capture threads seem to have stopped. Exiting main loop.")
+            if (display_archive_queue is None or not cfg_s_display_archive.get('enabled', False)) and \
+                    (detection_queue is None or not cfg_s_detection.get('enabled', False)) and \
+                    not stop_event.is_set():
+                logger.info("All relevant capture queues stopped. Exiting main logic loop.")
                 break
-
-
     except Exception as e:
         logger.critical(f"CRITICAL MAIN APP LOGIC ERROR: {e}", exc_info=True); stop_event.set()
     finally:
         logger.info("Main application logic finalizing...")
-        # Finalize person event clip if active
-        if event_rec_enabled and is_person_event_active and person_clip_frames_to_write:
-            logger.info("Shutdown: Saving pending person event clip (Ch102)...")
-            clip_fn_base = f"{event_record_cfg['filename_prefix']}_shutdown_{datetime.fromtimestamp(person_clip_start_ts if person_clip_start_ts else time.time()).strftime('%Y%m%d-%H%M%S%f')[:-3]}"
-            clip_fp_base = person_event_output_dir / clip_fn_base
-            first_f = next((f for f in person_clip_frames_to_write if f is not None), None)
-            if first_f: fh, fw = first_f.shape[:2]; save_video_segment(person_clip_frames_to_write, clip_fp_base,
-                                                                       detection_stream_fps, (fw, fh))
-            meta_fp = clip_fp_base.with_suffix('.meta.json')
-            # ... (save metadata for shutdown clip)
-            try:
-                with open(meta_fp, 'w') as f_meta:
-                    json.dump({"event_start_timestamp": person_clip_start_ts, "reason": "shutdown",
-                               "video_filename": clip_fp_base.with_suffix('.avi').name}, f_meta, indent=2)
-            except Exception as e_m:
-                logger.error(f"Err saving shutdown meta: {e_m}")
+        if event_rec_enabled and _is_person_event_active_state[0]: _finalize_person_clip_func("shutdown")
+        if periodic_enabled and periodic_segment_raw_frames: _finalize_periodic_clip_func("shutdown")
 
-        # Finalize periodic archive clip if active
-        if periodic_enabled and periodic_segment_raw_frames:
-            logger.info("Shutdown: Saving pending periodic archive segment (Ch101)...")
-            first_f = next((f for f in periodic_segment_raw_frames if f is not None), None)
-            if first_f: fh, fw = first_f.shape[:2];save_video_segment(periodic_segment_raw_frames,
-                                                                      periodic_output_dir / f"{periodic_record_cfg['filename_prefix']}_shutdown_{datetime.fromtimestamp(periodic_segment_start_ts_frame if periodic_segment_start_ts_frame else time.time()).strftime('%Y%m%d-%H%M%S%f')[:-3]}",
-                                                                      periodic_fps, (fw, fh))
-
-        if display_cfg.get('show_window', False):
+        if display_feed_queue:
             try:
-                cv2.destroyAllWindows()
-            except:
+                display_feed_queue.put_nowait(None)
+            except queue.Full:
                 pass
-
-        logger.info("Waiting for capture threads to complete shutdown...")
-        for t in capture_threads:
+        logger.info("Waiting for ALL threads to complete shutdown...")
+        all_threads_to_join = capture_threads + other_threads
+        for t in all_threads_to_join:
             if t.is_alive():
-                # Queues should have received None sentinel from their respective threads
-                t.join(timeout=3.0)
-                if t.is_alive(): logger.warning(f"Capture thread {t.name} did not finish.")
+                logger.debug(f"Joining thread {t.name}...")
+                t.join(timeout=2.0)  # Уменьшил таймаут для более быстрой остановки
+                if t.is_alive(): logger.warning(f"Thread {t.name} did not finish in time.")
+            else:
+                logger.debug(f"Thread {t.name} already stopped.")
         logger.info("Main application logic stopped.")

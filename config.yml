@@ -24,11 +24,11 @@ stream_detection:
   reconnect_delay_seconds: 5
 
 inference: # Настройки для модели, применяются к stream_detection
-  model_path: "models/yolov9-medium.onnx"
+  model_path: "models/yolov8n.pt"
   confidence_threshold: 0.50
   person_class_id: 0 # Убедитесь, что это ID "person" в вашей модели
-  device: "cpu" # "cuda:0" для GPU
-  process_every_nth_frame: 1 # Обрабатывать каждый N-й кадр из stream_detection для инференса
+  device: "cuda:0" # "cuda:0" для GPU
+  process_every_nth_frame: 3 # Обрабатывать каждый N-й кадр из stream_detection для инференса
   max_person_bbox_area_ratio: 0.85 # Фильтр для слишком больших детекций
   min_person_bbox_area_ratio: 0.002 # Фильтр для слишком маленьких детекций
 
