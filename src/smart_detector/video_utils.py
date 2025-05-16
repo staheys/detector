@@ -24,7 +24,7 @@ def create_video_capture(source: str | int, width: int, height: int, fps: int):
         gst_pipeline_str = " ".join(gst_elements)
         logger.info(f"Attempting GStreamer pipeline for {source}")
         logger.debug(f"GStreamer: {gst_pipeline_str}")
-        cap = cv2.VideoCapture(gst_pipeline_str, cv2.CAP_GSTREAMER)
+        cap = cv2.VideoCapture(gst_pipeline_str, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             logger.warning("GStreamer RTSP failed. Falling back to OpenCV default (FFmpeg).")
             cap = cv2.VideoCapture(source)
