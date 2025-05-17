@@ -1,13 +1,22 @@
 # db_api.py
+import configparser
 import sqlite3
 import datetime
 import os
 import logging
 import threading
+from typing import List, Dict
+
+import pytz
 
 # Configure logging for the DB API
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None # type: ignore
 
 DB_NAME = "tracking_data.db"
 
@@ -294,3 +303,199 @@ def get_config_rtsp_urls(config_path="config.conf") -> list:
                 break
     logger.info(f"GUI: Found {len(urls)} RTSP URLs from config for live view.")
     return urls
+
+
+# db_api.py
+# ... (существующие импорты) ...
+from ultralytics.utils import YAML  # Для чтения YAML
+from ultralytics.utils.checks import check_yaml  # Для проверки YAML
+
+
+# ... (существующий код) ...
+
+def get_available_classes_from_yaml(config_path="config.conf") -> List[str]:
+    """
+    Читает файл data.yaml, указанный в config.conf, и возвращает список имен классов.
+    """
+    cfg_parser = configparser.ConfigParser()
+    if not cfg_parser.read(config_path):
+        logger.error(f"Не удалось прочитать {config_path} для получения пути к YAML.")
+        return []
+
+    if 'YOLO' in cfg_parser and 'yaml_path' in cfg_parser['YOLO']:
+        yaml_file_path_str = cfg_parser['YOLO']['yaml_path']
+        try:
+            checked_yaml_path = check_yaml(yaml_file_path_str)  # Проверяет существование и т.д.
+            data_yaml = YAML.load(checked_yaml_path)
+            if 'names' in data_yaml and isinstance(data_yaml['names'], list):
+                logger.info(f"Загружены классы из {checked_yaml_path}: {data_yaml['names']}")
+                return data_yaml['names']
+            else:
+                logger.error(f"Ключ 'names' не найден или не является списком в {checked_yaml_path}")
+                return []
+        except Exception as e:
+            logger.error(f"Ошибка загрузки или парсинга YAML файла {yaml_file_path_str}: {e}")
+            return []
+    else:
+        logger.error("Секция [YOLO] или ключ 'yaml_path' не найдены в config.conf.")
+        return []
+
+
+def find_object_occurrences_and_video_segments(
+        class_name_filter: str,
+        start_time_utc_filter: datetime.datetime,  # Aware UTC
+        end_time_utc_filter: datetime.datetime  # Aware UTC
+) -> List[Dict]:
+    conn = None
+    all_target_segments_for_composition = []  # Список всех сегментов со всех объектов
+
+    start_utc_str_filter = start_time_utc_filter.isoformat()
+    end_utc_str_filter = end_time_utc_filter.isoformat()
+
+    logger.info(
+        f"Поиск ИНДИВИДУАЛЬНЫХ вхождений класса '{class_name_filter}' с {start_utc_str_filter} по {end_utc_str_filter}")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # 1. Найти все объекты заданного класса, которые были активны в заданном интервале
+        query_objects = """
+            SELECT tracker_object_id, class_name, first_seen_utc, last_seen_utc
+            FROM tracked_objects
+            WHERE class_name = ? 
+              AND first_seen_utc <= ?  
+              AND last_seen_utc >= ?   
+            ORDER BY first_seen_utc ASC 
+        """
+        # Запрос остается тем же, он находит всех кандидатов
+        cursor.execute(query_objects, (class_name_filter, end_utc_str_filter, start_utc_str_filter))
+        relevant_objects_from_db = cursor.fetchall()
+
+        if not relevant_objects_from_db:
+            logger.info(f"Объекты класса '{class_name_filter}' не найдены в БД по первичному SQL-запросу.")
+            return []
+
+        logger.info(
+            f"Найдено {len(relevant_objects_from_db)} потенциально релевантн(ых) объектов класса '{class_name_filter}'. Обработка каждого индивидуально...")
+
+        # Обрабатываем КАЖДЫЙ найденный объект индивидуально
+        for obj_row_idx, obj_row in enumerate(relevant_objects_from_db):
+            obj_tracker_id = obj_row["tracker_object_id"]
+
+            obj_first_seen_dt = datetime.datetime.fromisoformat(obj_row["first_seen_utc"])
+            obj_last_seen_dt = datetime.datetime.fromisoformat(obj_row["last_seen_utc"])
+
+            # Делаем datetime из БД "aware" UTC
+            obj_first_seen_utc = ensure_aware_utc(obj_first_seen_dt)
+            obj_last_seen_utc = ensure_aware_utc(obj_last_seen_dt)
+
+            # Определяем фактический интервал активности этого КОНКРЕТНОГО объекта ВНУТРИ фильтра
+            individual_event_start_utc = max(obj_first_seen_utc, start_time_utc_filter)
+            individual_event_end_utc = min(obj_last_seen_utc, end_time_utc_filter)
+
+            # Если интервал объекта после обрезки фильтром стал невалидным, пропускаем этот объект
+            if individual_event_start_utc >= individual_event_end_utc:
+                logger.debug(
+                    f"Объект ID {obj_tracker_id} ({obj_first_seen_utc.isoformat()} - {obj_last_seen_utc.isoformat()}) "
+                    f"не имеет активного периода внутри фильтра. Пропускается.")
+                continue
+
+            logger.info(f"Обработка объекта ID {obj_tracker_id}: активен с {individual_event_start_utc.isoformat()} "
+                        f"по {individual_event_end_utc.isoformat()} (в рамках фильтра).")
+
+            # 2. Для этого КОНКРЕТНОГО интервала [individual_event_start_utc, individual_event_end_utc]
+            #    найти все пересекающиеся видеоклипы.
+            query_clips_for_event = """
+                SELECT id, filename, start_time_utc, end_time_utc
+                FROM video_clips
+                WHERE start_time_utc <= ? -- Клип начался до/во время конца этого события
+                  AND (end_time_utc IS NULL OR end_time_utc >= ?) -- Клип закончился после/во время начала этого события
+                ORDER BY start_time_utc ASC
+            """
+            individual_event_start_str = individual_event_start_utc.isoformat()
+            individual_event_end_str = individual_event_end_utc.isoformat()
+
+            cursor.execute(query_clips_for_event, (individual_event_end_str, individual_event_start_str))
+            clips_for_this_event = cursor.fetchall()
+
+            if not clips_for_this_event:
+                logger.info(f"  Для объекта ID {obj_tracker_id} не найдено клипов, покрывающих его интервал активности "
+                            f"{individual_event_start_str} - {individual_event_end_str}.")
+                continue
+
+            logger.info(
+                f"  Для объекта ID {obj_tracker_id} найдено {len(clips_for_this_event)} клипов, покрывающих его интервал.")
+
+            for clip_row in clips_for_this_event:
+                clip_start_utc_dt_original = ensure_aware_utc(
+                    datetime.datetime.fromisoformat(clip_row["start_time_utc"]))
+
+                clip_end_utc_dt_original_or_event_end = None
+                if clip_row["end_time_utc"] is not None:
+                    clip_end_utc_dt_original_or_event_end = ensure_aware_utc(
+                        datetime.datetime.fromisoformat(clip_row["end_time_utc"]))
+                else:  # Клип еще идет
+                    clip_end_utc_dt_original_or_event_end = individual_event_end_utc  # Ограничиваем концом текущего события
+                    if clip_start_utc_dt_original > individual_event_end_utc:  # Активный клип начался после события
+                        continue
+
+                # Определяем пересечение интервала КЛИПА с интервалом АКТИВНОСТИ этого КОНКРЕТНОГО ОБЪЕКТА
+                # [individual_event_start_utc, individual_event_end_utc] <- интервал текущего события
+                # [clip_start_utc_dt_original, clip_end_utc_dt_original_or_event_end] <- интервал клипа
+
+                segment_start_utc = max(individual_event_start_utc, clip_start_utc_dt_original)
+                segment_end_utc = min(individual_event_end_utc, clip_end_utc_dt_original_or_event_end)
+
+                if segment_start_utc >= segment_end_utc:  # Нет значимого пересечения
+                    continue
+
+                start_offset = segment_start_utc - clip_start_utc_dt_original
+                end_offset = segment_end_utc - clip_start_utc_dt_original
+
+                if start_offset.total_seconds() < 0: start_offset = datetime.timedelta(seconds=0)
+
+                all_target_segments_for_composition.append({
+                    'filename': clip_row['filename'],
+                    'actual_segment_start_utc': segment_start_utc,  # Для сортировки
+                    'actual_segment_end_utc': segment_end_utc,  # Для информации
+                    'start_offset_in_clip': start_offset,
+                    'end_offset_in_clip': end_offset,
+                })
+                logger.info(
+                    f"    Добавлен сегмент из клипа {clip_row['filename']}: UTC {segment_start_utc.isoformat()} "
+                    f"до {segment_end_utc.isoformat()} (смещения: {start_offset} до {end_offset}).")
+
+        # Сортируем все найденные сегменты по их фактическому времени начала в UTC
+        all_target_segments_for_composition.sort(key=lambda seg: seg['actual_segment_start_utc'])
+
+        # ОПЦИОНАЛЬНО: Объединение перекрывающихся или смежных сегментов
+        # Это более сложная логика. Пока пропустим, video_composer должен справиться с последовательной склейкой.
+        # Если сегменты могут сильно перекрываться из-за разных объектов, это может привести к повторам.
+        # Если задача - показать *любое* появление класса, то перекрытия нужно объединять.
+        # Если для каждого объекта свой "фильм", то перекрытия не страшны.
+        # Сейчас мы собираем все появления класса.
+
+        if not all_target_segments_for_composition:
+            logger.info(f"Не сформировано ни одного итогового сегмента для класса '{class_name_filter}'.")
+
+        logger.info(
+            f"ИТОГО сформировано {len(all_target_segments_for_composition)} индивидуальных сегментов для компоновки.")
+        return all_target_segments_for_composition
+
+    except Exception as e:
+        logger.exception(f"Неожиданная ошибка при поиске ИНДИВИДУАЛЬНЫХ сегментов: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def ensure_aware_utc(dt_obj: datetime.datetime) -> datetime.datetime:
+    """Делает naive datetime объект aware UTC, или конвертирует existing aware в UTC."""
+    if dt_obj.tzinfo is None: # Если naive
+        if ZoneInfo:
+            return dt_obj.replace(tzinfo=ZoneInfo("UTC"))
+        else:
+            return pytz.utc.localize(dt_obj)
+    else: # Уже aware
+        return dt_obj.astimezone(ZoneInfo("UTC") if ZoneInfo else pytz.utc)

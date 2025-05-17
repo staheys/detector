@@ -1,16 +1,32 @@
 # gui.py
+import os
+import subprocess
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from sys import platform
+from tkinter import ttk, scrolledtext, messagebox, filedialog
+from typing import Optional
+from tzlocal import get_localzone
+
 import cv2
+import pytz
 from PIL import Image, ImageTk
 import threading
 import time
 import datetime
 import logging
 
+from tkcalendar import DateEntry
+
 # Assuming db_api.py is in the same directory or Python path
 import db_api
 import configparser  # For direct config reading if needed, though db_api handles some
+
+import video_composer
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    ZoneInfo = None # Если нет zoneinfo, будем полагаться на pytz
+    ZoneInfoNotFoundError = None #
 
 # Setup basic logging for the GUI module
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
@@ -204,6 +220,13 @@ class App(tk.Tk):
         self.notebook.add(self.tab_objects, text='Tracked Objects')
         self.setup_objects_tab()
 
+        self.tab_composer = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_composer, text='Video Composer')
+        self.setup_composer_tab()
+
+        self.notebook.pack(expand=True, fill='both', padx=10, pady=10)
+        self.load_data_periodically()
+
         self.notebook.pack(expand=True, fill='both', padx=10, pady=10)
 
         self.load_data_periodically()
@@ -323,6 +346,304 @@ class App(tk.Tk):
             self.load_objects_data()
 
         self.after(30000, self.load_data_periodically)  # Refresh DB data every 30 seconds
+
+    def setup_composer_tab(self):
+        composer_main_frame = ttk.Frame(self.tab_composer)
+        composer_main_frame.pack(padx=10, pady=10, fill='x')
+
+        # --- Параметры выбора ---
+        params_frame = ttk.LabelFrame(composer_main_frame, text="Parameters")
+        params_frame.pack(fill='x', expand=True, pady=5)
+
+        # Выбор класса
+        ttk.Label(params_frame, text="Object Class:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        self.composer_class_var = tk.StringVar()
+        self.composer_class_combo = ttk.Combobox(params_frame, textvariable=self.composer_class_var, state="readonly",
+                                                 width=25)
+        self.composer_class_combo.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+        self.load_composer_classes()  # Загружаем классы
+
+        # Выбор временного диапазона (локальное время)
+        ttk.Label(params_frame, text="Timezone:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        initial_tz_name = "UTC (detecting...)"
+        try:
+            tz_obj_init = get_localzone()
+            if hasattr(tz_obj_init, 'key'):  # ZoneInfo
+                initial_tz_name = tz_obj_init.key
+            elif hasattr(tz_obj_init, 'zone'):  # Pytz
+                initial_tz_name = tz_obj_init.zone
+            else:  # Неизвестный тип
+                initial_tz_name = str(tz_obj_init) if tz_obj_init else "UTC (unknown type)"
+        except Exception:
+            pass  # initial_tz_name останется "UTC (detecting...)" или можно установить "UTC (detection failed)"
+        self.composer_timezone_var = tk.StringVar(
+            value=str(datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo))  # Текущая локальная таймзона
+        self.composer_timezone_entry = ttk.Entry(params_frame, textvariable=self.composer_timezone_var, width=27,
+                                                 state="readonly")
+        self.composer_timezone_entry.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+
+        ttk.Label(params_frame, text="Start DateTime:").grid(row=2, column=0, padx=5, pady=5, sticky='w')
+        self.composer_start_date_entry = DateEntry(params_frame, width=12, background='darkblue', foreground='white',
+                                                   borderwidth=2, date_pattern='yyyy-mm-dd')
+        self.composer_start_date_entry.grid(row=2, column=1, padx=5, pady=5, sticky='w')
+        self.composer_start_time_hour = ttk.Spinbox(params_frame, from_=0, to=23, width=3, format="%02.0f")
+        self.composer_start_time_hour.grid(row=2, column=1, padx=(110, 0), pady=5, sticky='w')
+        self.composer_start_time_min = ttk.Spinbox(params_frame, from_=0, to=59, width=3, format="%02.0f")
+        self.composer_start_time_min.grid(row=2, column=1, padx=(160, 0), pady=5, sticky='w')
+        # Установка текущего времени минус 1 час
+        now = datetime.datetime.now()
+        one_hour_ago = now - datetime.timedelta(hours=1)
+        self.composer_start_date_entry.set_date(one_hour_ago.date())
+        self.composer_start_time_hour.set(f"{one_hour_ago.hour:02}")
+        self.composer_start_time_min.set(f"{one_hour_ago.minute:02}")
+
+        ttk.Label(params_frame, text="End DateTime:").grid(row=3, column=0, padx=5, pady=5, sticky='w')
+        self.composer_end_date_entry = DateEntry(params_frame, width=12, background='darkblue', foreground='white',
+                                                 borderwidth=2, date_pattern='yyyy-mm-dd')
+        self.composer_end_date_entry.grid(row=3, column=1, padx=5, pady=5, sticky='w')
+        self.composer_end_time_hour = ttk.Spinbox(params_frame, from_=0, to=23, width=3, format="%02.0f")
+        self.composer_end_time_hour.grid(row=3, column=1, padx=(110, 0), pady=5, sticky='w')
+        self.composer_end_time_min = ttk.Spinbox(params_frame, from_=0, to=59, width=3, format="%02.0f")
+        self.composer_end_time_min.grid(row=3, column=1, padx=(160, 0), pady=5, sticky='w')
+        self.composer_end_date_entry.set_date(now.date())
+        self.composer_end_time_hour.set(f"{now.hour:02}")
+        self.composer_end_time_min.set(f"{now.minute:02}")
+
+        params_frame.columnconfigure(1, weight=1)
+
+        # --- Кнопка и статус ---
+        action_frame = ttk.Frame(composer_main_frame)
+        action_frame.pack(fill='x', expand=True, pady=5)
+
+        self.compose_button = ttk.Button(action_frame, text="Create Composite Video",
+                                         command=self.run_video_composition)
+        self.compose_button.pack(side='left', padx=5)
+
+        self.composer_status_label = ttk.Label(action_frame, text="Status: Ready")
+        self.composer_status_label.pack(side='left', padx=5, fill='x', expand=True)
+
+        # --- Результат ---
+        result_frame = ttk.LabelFrame(composer_main_frame, text="Result")
+        result_frame.pack(fill='both', expand=True, pady=5)
+        self.result_text_area = scrolledtext.ScrolledText(result_frame, height=10, wrap=tk.WORD, state='disabled')
+        self.result_text_area.pack(fill='both', expand=True, padx=5, pady=5)
+
+        self.download_button = ttk.Button(result_frame, text="Download/Open Video", state='disabled',
+                                          command=self.download_or_open_composed_video)
+        self.download_button.pack(pady=5)
+        self.composed_video_path = None
+
+    def load_composer_classes(self):
+        classes = db_api.get_available_classes_from_yaml()
+        if classes:
+            self.composer_class_combo['values'] = classes
+            if classes:
+                self.composer_class_combo.set(classes[0])  # Выбрать первый по умолчанию
+        else:
+            self.composer_class_combo['values'] = ["Error: No classes found"]
+            self.composer_class_combo.set("Error: No classes found")
+            logger.error("GUI Composer: Не удалось загрузить классы объектов.")
+
+    def _set_composer_status(self, message, is_error=False):
+        self.composer_status_label.config(text=f"Status: {message}",
+                                          foreground='red' if is_error else 'black')
+        logger.info(f"Composer Status: {message}")
+
+    def _append_result_text(self, message):
+        self.result_text_area.config(state='normal')
+        self.result_text_area.insert(tk.END, message + "\n")
+        self.result_text_area.see(tk.END)  # Прокрутка вниз
+        self.result_text_area.config(state='disabled')
+
+    def get_selected_datetime_utc(self, date_entry, hour_spinbox, min_spinbox) -> Optional[datetime.datetime]:
+        try:
+            date_val = date_entry.get_date()
+            hour_val = int(hour_spinbox.get())
+            min_val = int(min_spinbox.get())
+
+            # Создаем наивный datetime объект из пользовательского ввода
+            naive_local_dt = datetime.datetime(date_val.year, date_val.month, date_val.day, hour_val, min_val)
+
+            aware_local_dt = None
+            local_tz_name_for_display = "UTC (could not determine local)"
+
+            try:
+                local_tz_obj = get_localzone()  # Может вернуть zoneinfo.ZoneInfo или pytz.timezone
+
+                if hasattr(local_tz_obj, 'key'):  # Это zoneinfo.ZoneInfo (IANA)
+                    local_tz_name_for_display = local_tz_obj.key
+                    aware_local_dt = naive_local_dt.replace(tzinfo=local_tz_obj)
+                elif hasattr(local_tz_obj, 'zone'):  # Это pytz.timezone
+                    local_tz_name_for_display = local_tz_obj.zone
+                    aware_local_dt = local_tz_obj.localize(naive_local_dt, is_dst=None)
+                else:  # Неожиданный тип объекта временной зоны
+                    logger.warning(
+                        f"tzlocal вернул неожиданный тип объекта зоны: {type(local_tz_obj)}. Используем UTC.")
+                    # В этом случае self.composer_timezone_var.get() может не содержать имени зоны
+                    # Лучше здесь явно присвоить UTC и обновить GUI, если возможно
+                    if ZoneInfo:  # Предпочитаем встроенный ZoneInfo для UTC
+                        aware_local_dt = naive_local_dt.replace(tzinfo=ZoneInfo("UTC"))
+                    else:  # Fallback на pytz.utc
+                        aware_local_dt = pytz.utc.localize(naive_local_dt)
+                    local_tz_name_for_display = "UTC"
+
+                logger.info(f"Определена локальная таймзона: {local_tz_name_for_display}")
+                # Обновляем отображаемую таймзону в GUI, если это первый успешный вызов
+                if self.composer_timezone_var.get() != local_tz_name_for_display and "UTC (could not detect local)" in self.composer_timezone_var.get():
+                    self.composer_timezone_var.set(local_tz_name_for_display)
+
+            except Exception as e_tz:
+                logger.error(
+                    f"Не удалось определить/использовать локальную таймзону: {e_tz}. Предполагается ввод в UTC.",
+                    exc_info=True)
+                self._set_composer_status("Warning: Could not determine local timezone. Assuming input is UTC.",
+                                          is_error=True)
+                if ZoneInfo:
+                    aware_local_dt = naive_local_dt.replace(tzinfo=ZoneInfo("UTC"))
+                else:
+                    aware_local_dt = pytz.utc.localize(naive_local_dt)
+                local_tz_name_for_display = "UTC"
+                self.composer_timezone_var.set(local_tz_name_for_display)  # Обновить GUI
+
+            if aware_local_dt is None:  # Если не удалось создать aware_local_dt
+                raise ValueError("Не удалось создать aware datetime из локального времени.")
+
+            # Конвертируем в UTC
+            if ZoneInfo:  # Предпочитаем конвертацию с использованием ZoneInfo, если возможно
+                dt_utc = aware_local_dt.astimezone(ZoneInfo("UTC"))
+            else:  # Fallback на pytz.utc
+                dt_utc = aware_local_dt.astimezone(pytz.utc)
+
+            logger.info(
+                f"Локальное время {naive_local_dt} ({local_tz_name_for_display}) конвертировано в UTC: {dt_utc.isoformat()}")
+            return dt_utc
+
+        except Exception as e:
+            logger.error(f"Ошибка конвертации времени в UTC: {e}", exc_info=True)
+            self._set_composer_status(f"Error parsing datetime: {e}", is_error=True)
+            messagebox.showerror("Input Error", f"Invalid date/time input or timezone issue: {e}")
+            return None
+
+    def run_video_composition_thread(self, class_filter, start_utc, end_utc):
+        try:
+            self.compose_button.config(state='disabled')
+            self.download_button.config(state='disabled')
+            self.composed_video_path = None
+            self.result_text_area.config(state='normal')
+            self.result_text_area.delete(1.0, tk.END)  # Очистить предыдущие результаты
+            self.result_text_area.config(state='disabled')
+
+            self._set_composer_status(
+                f"Searching for '{class_filter}' from {start_utc.strftime('%Y-%m-%d %H:%M')} to {end_utc.strftime('%Y-%m-%d %H:%M')} UTC...")
+            self._append_result_text(f"Searching for object class: '{class_filter}'")
+            self._append_result_text(f"Time range (UTC): {start_utc.isoformat()} to {end_utc.isoformat()}")
+
+            video_segments = db_api.find_object_occurrences_and_video_segments(class_filter, start_utc, end_utc)
+
+            if not video_segments:
+                self._set_composer_status(f"No relevant video segments found for '{class_filter}'.", is_error=True)
+                self._append_result_text("No video segments found matching criteria.")
+                return
+
+            self._append_result_text(f"Found {len(video_segments)} video segments to process.")
+            for i, seg in enumerate(video_segments):
+                self._append_result_text(
+                    f"  Segment {i + 1}: {seg['filename']} from {seg['start_offset_in_clip']} to {seg['end_offset_in_clip']}")
+
+            self._set_composer_status("Compositing video... This may take a while.")
+            # Имя файла для композитного видео
+            timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_class_name = "".join(
+                c if c.isalnum() else "_" for c in class_filter)  # Делаем имя класса безопасным для файла
+            output_filename = f"composite_{safe_class_name}_{timestamp_str}.avi"
+
+            # Получаем путь к записям из config.conf (лучше бы через db_api, но для примера)
+            cfg = configparser.ConfigParser()
+            cfg.read("config.conf")
+            recordings_path = cfg.get('RECORDING', 'output_path', fallback='./recordings/')
+
+            # Запуск компоновки в самом VideoComposer
+            # video_composer.create_composite_video_ffmpeg(...) # Если бы использовали ffmpeg
+            self.composed_video_path = video_composer.create_composite_video_opencv(
+                video_segments,
+                output_filename,
+                recordings_path
+            )
+
+            if self.composed_video_path and os.path.exists(self.composed_video_path):
+                self._set_composer_status("Video composition successful!")
+                self._append_result_text(f"Composite video created: {self.composed_video_path}")
+                self.download_button.config(state='normal')
+            else:
+                self._set_composer_status("Video composition failed.", is_error=True)
+                self._append_result_text("Failed to create composite video. Check logs.")
+
+        except Exception as e:
+            self._set_composer_status(f"Error during composition: {e}", is_error=True)
+            self._append_result_text(f"ERROR: {e}")
+            logger.exception("GUI: Error in video composition thread")
+        finally:
+            if self.compose_button.winfo_exists():  # Проверка, что виджет еще существует
+                self.compose_button.config(state='normal')
+
+    def run_video_composition(self):
+        class_filter = self.composer_class_var.get()
+        if not class_filter or "Error:" in class_filter:
+            messagebox.showerror("Input Error", "Please select a valid object class.")
+            return
+
+        start_utc = self.get_selected_datetime_utc(self.composer_start_date_entry, self.composer_start_time_hour,
+                                                   self.composer_start_time_min)
+        end_utc = self.get_selected_datetime_utc(self.composer_end_date_entry, self.composer_end_time_hour,
+                                                 self.composer_end_time_min)
+
+        if not start_utc or not end_utc:
+            return  # Ошибка уже показана в get_selected_datetime_utc
+
+        if start_utc >= end_utc:
+            messagebox.showerror("Input Error", "Start DateTime must be before End DateTime.")
+            return
+
+        # Запускаем тяжелую операцию в отдельном потоке, чтобы не блокировать GUI
+        composition_thread = threading.Thread(
+            target=self.run_video_composition_thread,
+            args=(class_filter, start_utc, end_utc),
+            daemon=True
+        )
+        composition_thread.name = "VideoCompositionThread"
+        composition_thread.start()
+
+    def download_or_open_composed_video(self):
+        if self.composed_video_path and os.path.exists(self.composed_video_path):
+            try:
+                if platform.system() == "Windows":
+                    os.startfile(self.composed_video_path)
+                elif platform.system() == "Darwin":  # macOS
+                    subprocess.call(["open", self.composed_video_path])
+                else:  # Linux and other UNIX-like
+                    subprocess.call(["xdg-open", self.composed_video_path])
+                self._append_result_text(f"Attempting to open video: {self.composed_video_path}")
+            except Exception as e:
+                logger.error(f"Failed to open video automatically: {e}")
+                self._append_result_text(f"Could not open video automatically. Path: {self.composed_video_path}")
+                # Предложить сохранить как...
+                save_path = filedialog.asksaveasfilename(
+                    initialdir=os.path.dirname(self.composed_video_path),  # Начать с директории, где он уже есть
+                    initialfile=os.path.basename(self.composed_video_path),
+                    defaultextension=".avi",
+                    filetypes=[("AVI videos", "*.avi"), ("All files", "*.*")]
+                )
+                if save_path:
+                    try:
+                        import shutil
+                        shutil.copy2(self.composed_video_path, save_path)
+                        self._append_result_text(f"Video copied to: {save_path}")
+                        messagebox.showinfo("Download Complete", f"Video saved to: {save_path}")
+                    except Exception as ex_copy:
+                        logger.error(f"Error copying video to {save_path}: {ex_copy}")
+                        messagebox.showerror("Copy Error", f"Failed to copy video: {ex_copy}")
+        else:
+            messagebox.showwarning("No Video", "No composite video available to download/open.")
 
     def on_closing(self):
         global stop_camera_threads
