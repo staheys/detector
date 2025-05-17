@@ -499,3 +499,65 @@ def ensure_aware_utc(dt_obj: datetime.datetime) -> datetime.datetime:
             return pytz.utc.localize(dt_obj)
     else: # Уже aware
         return dt_obj.astimezone(ZoneInfo("UTC") if ZoneInfo else pytz.utc)
+
+def get_video_clips_older_than(cutoff_utc_datetime: datetime.datetime) -> List[tuple]:
+    """Возвращает ID, имя файла и время начала клипов, которые ЗАКОНЧИЛИСЬ до cutoff_utc_datetime."""
+    conn = None
+    cutoff_str = cutoff_utc_datetime.isoformat()
+    clips = []
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Ищем клипы, где end_time_utc (время конца клипа) старше cutoff_str
+        # Если end_time_utc is NULL, клип считается текущим и не удаляется по дате (если только он не очень старый)
+        # Для большей строгости, можно также добавить условие на start_time_utc, если клип очень длинный и еще не закончился.
+        # Пока что: удаляем только те, что точно закончились и старые.
+        cursor.execute(
+            "SELECT id, filename, start_time_utc FROM video_clips WHERE end_time_utc IS NOT NULL AND end_time_utc < ? ORDER BY end_time_utc ASC",
+            (cutoff_str,)
+        )
+        clips = cursor.fetchall() # Возвращает список кортежей (id, filename, start_time_utc)
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка БД при получении старых клипов: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return clips
+
+
+def get_oldest_video_clips(limit: int = 1) -> List[tuple]:
+    """Возвращает самые старые клипы из БД, отсортированные по времени начала."""
+    conn = None
+    clips = []
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Берем самые старые по времени НАЧАЛА, но только те, что уже ЗАКОНЧИЛИСЬ
+        # чтобы не удалить случайно текущий активный клип, если он единственный
+        cursor.execute(
+            "SELECT id, filename, start_time_utc FROM video_clips WHERE end_time_utc IS NOT NULL ORDER BY start_time_utc ASC LIMIT ?",
+            (limit,)
+        )
+        clips = cursor.fetchall()
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка БД при получении самых старых клипов: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return clips
+
+
+def delete_video_clip_record(clip_id: int):
+    """Удаляет запись о видеоклипе из БД по его ID."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM video_clips WHERE id = ?", (clip_id,))
+        conn.commit()
+        logger.info(f"Удалена запись о видеоклипе с ID {clip_id} из БД.")
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка БД при удалении записи о клипе ID {clip_id}: {e}")
+    finally:
+        if conn:
+            conn.close()

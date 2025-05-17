@@ -3,9 +3,15 @@ import os
 import subprocess
 import tkinter as tk
 from sys import platform
-from tkinter import ttk, scrolledtext, messagebox, filedialog
+from tkinter import ttk, scrolledtext, messagebox, filedialog, HORIZONTAL
 from typing import Optional
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 from tzlocal import get_localzone
+import archive_manager
+import matplotlib
+
 
 import cv2
 import pytz
@@ -186,14 +192,37 @@ class CameraStreamWidget(ttk.Frame):
 
 
 class App(tk.Tk):
+    MATPLOTLIB_AVAILABLE = True
     def __init__(self):
         super().__init__()
         self.title("System Monitor GUI")
-        self.geometry("1200x800")
+        self.geometry("1800x900")
 
         # Initialize DB and ensure tables exist
         try:
             db_api.initialize_database()
+            self.recordings_path = "./recordings/"
+            self.archive_cleaner_instance_gui = None  # Переименовал для ясности
+            try:
+                cfg_parser_gui = configparser.ConfigParser()
+                if cfg_parser_gui.read("config.conf"):
+                    self.recordings_path = cfg_parser_gui.get('RECORDING', 'output_path', fallback='./recordings/')
+                    # Эти значения теперь в основном для отображения и ручного задания
+                    default_days_gui = cfg_parser_gui.getint('ARCHIVE', 'retention_days', fallback=30)
+                    default_size_gb_gui = cfg_parser_gui.getfloat('ARCHIVE', 'max_size_gb', fallback=500.0)
+                    # cleanup_interval_hours больше не нужен GUI для автозапуска
+
+                    self.archive_cleaner_instance_gui = archive_manager.ArchiveCleaner(
+                        db_api_module=db_api,
+                        recordings_path=self.recordings_path,
+                        config_max_days=default_days_gui,  # Используется как начальное значение для слайдера
+                        config_max_size_gb=default_size_gb_gui  # Используется для проверки лимита при ручной очистке
+                    )
+                    logger.info("ArchiveCleaner (GUI-экземпляр) инициализирован для ручного управления и отображения.")
+                else:
+                    logger.error("GUI: Не удалось прочитать config.conf для настроек архива (GUI-экземпляр).")
+            except Exception as e:
+                logger.error(f"GUI: Ошибка инициализации ArchiveCleaner (GUI-экземпляр): {e}")
         except Exception as e:
             logger.critical(f"GUI: Failed to initialize database: {e}")
             messagebox.showerror("Database Error", f"Could not initialize database: {e}\nApplication will exit.")
@@ -211,18 +240,24 @@ class App(tk.Tk):
         self.setup_camera_tab()
 
         # Tab 2: Recorded Video Clips
-        self.tab_clips = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_clips, text='Video Clips')
-        self.setup_clips_tab()
+        # self.tab_clips = ttk.Frame(self.notebook)
+        # self.notebook.add(self.tab_clips, text='Video Clips')
+        # self.setup_clips_tab()
 
         # Tab 3: Tracked Objects
-        self.tab_objects = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_objects, text='Tracked Objects')
-        self.setup_objects_tab()
+        # self.tab_objects = ttk.Frame(self.notebook)
+        # self.notebook.add(self.tab_objects, text='Tracked Objects')
+        # self.setup_objects_tab()
 
         self.tab_composer = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_composer, text='Video Composer')
         self.setup_composer_tab()
+        self.tab_archive = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_archive, text='Archive Management')
+        self.setup_archive_tab()  # Новая функция для настройки вкладки
+
+        self.notebook.pack(expand=True, fill='both', padx=10, pady=10)
+        self.load_data_periodically()
 
         self.notebook.pack(expand=True, fill='both', padx=10, pady=10)
         self.load_data_periodically()
@@ -236,6 +271,7 @@ class App(tk.Tk):
         camera_frame_container.pack(expand=True, fill='both', padx=5, pady=5)
 
         rtsp_urls_data = db_api.get_config_rtsp_urls()
+        rtsp_urls_data = [{'name': 'Entrance Camera', 'url': 'rtsp://admin:qwerty13579@192.168.0.3:554/Streaming/Channels/101'}]
         if not rtsp_urls_data:
             ttk.Label(camera_frame_container,
                       text="No camera streams configured in config.conf ([RTSP]url, [RECORDING]rtsp_url, or [GUI_CAMERAS]).").pack(
@@ -244,11 +280,11 @@ class App(tk.Tk):
 
         # Simple grid layout for cameras
         # Adjust num_cols as needed, e.g. based on number of cameras or desired layout
-        num_cols = 2
+        num_cols = 1
         for i, cam_data in enumerate(rtsp_urls_data):
             row, col = divmod(i, num_cols)
-            cam_widget = CameraStreamWidget(camera_frame_container, cam_data["name"], cam_data["url"], width=480,
-                                            height=360)
+            cam_widget = CameraStreamWidget(camera_frame_container, cam_data["name"], cam_data["url"], width=1280,
+                                            height=720)
             cam_widget.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
             self.camera_widgets.append(cam_widget)
             camera_frame_container.grid_columnconfigure(col, weight=1)
@@ -524,6 +560,270 @@ class App(tk.Tk):
             messagebox.showerror("Input Error", f"Invalid date/time input or timezone issue: {e}")
             return None
 
+    def setup_archive_tab(self, MATPLOTLIB_AVAILABLE=None):
+        archive_main_frame = ttk.Frame(self.tab_archive)
+        archive_main_frame.pack(padx=10, pady=10, fill='both', expand=True)
+
+        # --- Диаграмма использования диска (если Matplotlib доступен) ---
+        self.disk_usage_figure_canvas = None
+        if MATPLOTLIB_AVAILABLE:
+            disk_frame = ttk.LabelFrame(archive_main_frame, text="Disk Usage")
+            disk_frame.pack(pady=10, padx=10, fill='x')
+
+            fig = Figure(figsize=(5, 3), dpi=100)  # Уменьшил размер для компактности
+            self.ax_disk_usage = fig.add_subplot(111)
+            self.ax_disk_usage.axis('equal')  # Для круговой диаграммы
+
+            self.disk_usage_figure_canvas = FigureCanvasTkAgg(fig, master=disk_frame)
+            self.disk_usage_figure_canvas.draw()
+            self.disk_usage_figure_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        else:
+            self.disk_text_info_var = tk.StringVar(value="Disk usage info unavailable (Matplotlib not found).")
+            ttk.Label(archive_main_frame, textvariable=self.disk_text_info_var).pack(pady=10)
+
+        # --- Настройки хранения ---
+        settings_frame = ttk.LabelFrame(archive_main_frame, text="Storage Settings")
+        settings_frame.pack(pady=10, padx=10, fill='x')
+
+        ttk.Label(settings_frame, text="Retention Depth (days):").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+
+        self.retention_days_var = tk.IntVar()
+        if self.archive_cleaner_instance_gui:
+            self.retention_days_var.set(self.archive_cleaner_instance_gui.max_days)
+        else:
+            self.retention_days_var.set(30)  # Значение по умолчанию, если cleaner не инициализирован
+
+        self.retention_slider = tk.Scale(settings_frame, from_=7, to_=60, orient=HORIZONTAL,
+                                         variable=self.retention_days_var, length=300,
+                                         command=self.on_retention_slider_change_display_only)  # Только отображение
+        self.retention_slider.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+
+        self.retention_days_label_val = ttk.Label(settings_frame, text=f"{self.retention_days_var.get()} days")
+        self.retention_days_label_val.grid(row=0, column=2, padx=5, pady=5)
+
+        apply_button = ttk.Button(settings_frame, text="Apply Retention & Clean",
+                                  command=self.apply_and_clean_archive_manual)
+        apply_button.grid(row=1, column=0, columnspan=3, pady=10)
+
+        # --- Статус очистки ---
+        self.archive_status_label = ttk.Label(archive_main_frame, text="Archive Status: Ready")
+        self.archive_status_label.pack(pady=10, fill='x')
+
+        self.update_disk_usage_display()  # Первоначальное отображение
+
+    def on_retention_slider_change_display_only(self, value_str):
+        # value_str приходит как строка от Scale
+        self.retention_days_label_val.config(text=f"{int(value_str)} days")
+
+    def apply_and_clean_archive_manual_thread(self):
+        if not self.archive_cleaner_instance_gui:
+            self.archive_status_label.config(text="Archive Status: Cleaner not initialized.")
+            messagebox.showerror("Error", "Archive cleaner is not available.")
+            return
+
+        new_days = self.retention_days_var.get()
+        self.archive_cleaner_instance_gui.set_retention_days(new_days)
+        self.archive_status_label.config(
+            text=f"Archive Status: Applying new retention ({new_days} days) and cleaning...")
+
+        try:
+            self.apply_retention_button.config(state="disabled")  # Если кнопка была бы отдельной
+            # В нашем случае, apply_button - это кнопка, которая вызывает этот метод.
+            # Если бы это была кнопка "Apply", то её бы блокировали.
+            # Сейчас мы блокируем кнопку, которая запустила этот поток.
+            # Найдем ее по имени или передадим как аргумент. Для простоты предположим, что она одна.
+            # Можно найти виджет по имени, если оно задано, или передать self.tab_archive.winfo_children() и найти.
+            # Для простоты, будем управлять активностью кнопки через состояние потока.
+
+            logger.info(f"Ручной запуск очистки архива с новым сроком хранения: {new_days} дней.")
+            deleted_count, freed_mb = self.archive_cleaner_instance_gui.cleanup_archive()
+            freed_gb = freed_mb / (1024 ** 3)
+
+            result_message = f"Cleanup complete. Deleted: {deleted_count} files, Freed: {freed_gb:.2f} GB."
+            self.archive_status_label.config(text=f"Archive Status: {result_message}")
+            logger.info(result_message)
+            self.update_disk_usage_display()  # Обновить диаграмму
+        except Exception as e:
+            error_msg = f"Error during manual archive cleanup: {e}"
+            self.archive_status_label.config(text=f"Archive Status: {error_msg}")
+            logger.error(error_msg, exc_info=True)
+        finally:
+            # Разблокировать кнопку (нужно найти кнопку и сделать .config(state="normal"))
+            # Это будет сделано в apply_and_clean_archive_manual после thread.start()
+            # или через проверку is_alive, но лучше передавать кнопку или использовать флаг.
+            # Пока оставим так, кнопка разблокируется после завершения потока в основном методе.
+            pass
+
+    def on_retention_slider_change_display_only(self, value_str):
+        # value_str приходит как строка от Scale
+        self.retention_days_label_val.config(text=f"{int(value_str)} days")
+
+    def apply_and_clean_archive_manual_thread(self):
+        if not self.archive_cleaner_instance_gui:
+            self.archive_status_label.config(text="Archive Status: Cleaner not initialized.")
+            messagebox.showerror("Error", "Archive cleaner is not available.")
+            return
+
+        new_days = self.retention_days_var.get()
+        self.archive_cleaner_instance_gui.set_retention_days(new_days)
+        self.archive_status_label.config(
+            text=f"Archive Status: Applying new retention ({new_days} days) and cleaning...")
+
+        try:
+            self.apply_retention_button.config(state="disabled")  # Если кнопка была бы отдельной
+            # В нашем случае, apply_button - это кнопка, которая вызывает этот метод.
+            # Если бы это была кнопка "Apply", то её бы блокировали.
+            # Сейчас мы блокируем кнопку, которая запустила этот поток.
+            # Найдем ее по имени или передадим как аргумент. Для простоты предположим, что она одна.
+            # Можно найти виджет по имени, если оно задано, или передать self.tab_archive.winfo_children() и найти.
+            # Для простоты, будем управлять активностью кнопки через состояние потока.
+
+            logger.info(f"Ручной запуск очистки архива с новым сроком хранения: {new_days} дней.")
+            deleted_count, freed_mb = self.archive_cleaner_instance_gui.cleanup_archive()
+            freed_gb = freed_mb / (1024 ** 3)
+
+            result_message = f"Cleanup complete. Deleted: {deleted_count} files, Freed: {freed_gb:.2f} GB."
+            self.archive_status_label.config(text=f"Archive Status: {result_message}")
+            logger.info(result_message)
+            self.update_disk_usage_display()  # Обновить диаграмму
+        except Exception as e:
+            error_msg = f"Error during manual archive cleanup: {e}"
+            self.archive_status_label.config(text=f"Archive Status: {error_msg}")
+            logger.error(error_msg, exc_info=True)
+        finally:
+            # Разблокировать кнопку (нужно найти кнопку и сделать .config(state="normal"))
+            # Это будет сделано в apply_and_clean_archive_manual после thread.start()
+            # или через проверку is_alive, но лучше передавать кнопку или использовать флаг.
+            # Пока оставим так, кнопка разблокируется после завершения потока в основном методе.
+            pass
+
+    def apply_and_clean_archive_manual(self):
+        # Найти кнопку и заблокировать ее
+        # Это упрощенный пример, в реальном коде нужно быть аккуратнее с поиском виджетов
+        # или передавать ссылку на кнопку.
+        button_to_disable = None
+        for widget_toplevel in self.tab_archive.winfo_children():  # Ищем LabelFrame
+            if isinstance(widget_toplevel, ttk.LabelFrame) and "Storage Settings" in widget_toplevel.cget("text"):
+                for widget_settings in widget_toplevel.winfo_children():  # Ищем кнопку внутри LabelFrame
+                    if isinstance(widget_settings, ttk.Button) and "Apply Retention & Clean" in widget_settings.cget(
+                            "text"):
+                        button_to_disable = widget_settings
+                        break
+                if button_to_disable: break
+
+        if button_to_disable:
+            button_to_disable.config(state="disabled")
+
+        cleanup_thread = threading.Thread(target=self.apply_and_clean_archive_manual_thread, daemon=True)
+        cleanup_thread.name = "ManualArchiveCleanupThread"
+        cleanup_thread.start()
+
+        # Следим за потоком, чтобы разблокировать кнопку
+        self.after(100, self.check_manual_cleanup_thread_status, cleanup_thread, button_to_disable)
+
+    def check_manual_cleanup_thread_status(self, thread, button):
+        if thread.is_alive():
+            self.after(100, self.check_manual_cleanup_thread_status, thread, button)
+        else:
+            if button and button.winfo_exists():
+                button.config(state="normal")
+            logger.info("Поток ручной очистки завершен, кнопка разблокирована.")
+
+    def update_disk_usage_display(self, MATPLOTLIB_AVAILABLE=None):
+        if not self.archive_cleaner_instance_gui:
+            logger.warning("ArchiveCleaner не инициализирован, не могу обновить использование диска.")
+            if not MATPLOTLIB_AVAILABLE:
+                self.disk_text_info_var.set("Disk usage: Archive cleaner not available.")
+            return
+
+        total_b, used_b_overall, free_b_overall = archive_manager.get_disk_usage(self.recordings_path)
+
+        # Размер архива (занято нашими .avi файлами)
+        archive_size_b = self.archive_cleaner_instance_gui.get_current_archive_size()
+
+        # Зарезервированное место под архив (исходя из max_size_bytes)
+        # Это не совсем "зарезервированное" системой, а скорее наш целевой максимум.
+        # Если max_size_bytes больше, чем free_b_overall + archive_size_b, то у нас проблемы с местом.
+        # Для диаграммы покажем: archive_size_b, (max_size_bytes - archive_size_b) -> как "планируемое свободное в рамках лимита", и остальное.
+
+        # Более простая интерпретация для диаграммы:
+        # 1. Место, занятое архивом (archive_size_b)
+        # 2. Место, занятое ДРУГИМИ файлами на этом же диске/разделе (used_b_overall - archive_size_b)
+        # 3. Свободное место на диске (free_b_overall)
+
+        if total_b == 0:  # Не удалось получить инфо о диске
+            if MATPLOTLIB_AVAILABLE and self.disk_usage_figure_canvas:
+                self.ax_disk_usage.clear()
+                self.ax_disk_usage.text(0.5, 0.5, "Disk info error", ha='center', va='center')
+                self.disk_usage_figure_canvas.draw()
+            elif not MATPLOTLIB_AVAILABLE:
+                self.disk_text_info_var.set(f"Total: N/A, Used by archive: {archive_size_b / (1024 ** 3):.2f} GB")
+            return
+
+        occupied_by_archive_gb = archive_size_b / (1024 ** 3)
+        # used_b_overall включает archive_size_b
+        occupied_by_other_gb = (used_b_overall - archive_size_b) / (1024 ** 3)
+        if occupied_by_other_gb < 0: occupied_by_other_gb = 0  # На случай погрешностей или если нет других файлов
+
+        free_overall_gb = free_b_overall / (1024 ** 3)
+        total_gb = total_b / (1024 ** 3)
+
+        if MATPLOTLIB_AVAILABLE and self.disk_usage_figure_canvas:
+            self.ax_disk_usage.clear()
+            labels = [f'Archive ({occupied_by_archive_gb:.2f} GB)',
+                      f'Other Used ({occupied_by_other_gb:.2f} GB)',
+                      f'Free ({free_overall_gb:.2f} GB)']
+            sizes = [archive_size_b, used_b_overall - archive_size_b, free_b_overall]
+            # Убираем отрицательные или нулевые значения для корректного отображения
+            valid_sizes = [s for s in sizes if s > 0]
+            valid_labels = [labels[i] for i, s in enumerate(sizes) if s > 0]
+
+            if valid_sizes:
+                self.ax_disk_usage.pie(valid_sizes, labels=valid_labels, autopct='%1.1f%%', startangle=90,
+                                       wedgeprops=dict(width=0.4, edgecolor='w'))  # Кольцевая диаграмма
+                self.ax_disk_usage.set_title(f"Disk Usage (Total: {total_gb:.2f} GB)", fontsize=10)
+            else:
+                self.ax_disk_usage.text(0.5, 0.5, "No disk data to show", ha='center', va='center')
+
+            self.ax_disk_usage.axis('equal')
+            self.disk_usage_figure_canvas.draw()
+        elif not MATPLOTLIB_AVAILABLE:
+            self.disk_text_info_var.set(
+                f"Total: {total_gb:.2f} GB, Used by Archive: {occupied_by_archive_gb:.2f} GB, "
+                f"Other Used: {occupied_by_other_gb:.2f} GB, Free: {free_overall_gb:.2f} GB"
+            )
+
+        # Обновляем периодически (например, при обновлении других данных или по таймеру)
+        # Сейчас это вызывается после ручной очистки и при инициализации вкладки.
+
+    def load_data_periodically(self):
+        """Periodically refreshes data in non-camera tabs."""
+        active_tab_index = -1
+        try:
+            active_tab_index = self.notebook.index(self.notebook.select())
+        except tk.TclError:  # Если вкладка еще не выбрана или notebook уничтожен
+            pass
+
+        if active_tab_index == 1:  # Clips tab
+            self.load_clips_data()
+        elif active_tab_index == 2:  # Objects tab
+            self.load_objects_data()
+        elif active_tab_index == 4:  # Archive Management tab
+            self.update_disk_usage_display()  # Обновляем диаграмму, если она активна
+
+        self.after(15000, self.load_data_periodically)  # Уменьшил интервал для диска
+
+    def on_closing(self):
+        global stop_camera_threads
+        logger.info("GUI: Close button pressed. Shutting down threads.")
+        stop_camera_threads = True
+
+        if self.archive_cleaner_instance_gui:
+            self.archive_cleaner_instance_gui.stop_periodic_cleanup()
+
+        # ... (остальная часть on_closing для камер) ...
+        self.destroy()
+    
     def run_video_composition_thread(self, class_filter, start_utc, end_utc):
         try:
             self.compose_button.config(state='disabled')

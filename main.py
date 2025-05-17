@@ -12,6 +12,7 @@ from ultralytics.utils.checks import check_requirements, check_yaml
 import datetime  # For UTC timestamps
 import logging  # For logging
 
+import archive_manager
 # Import custom modules
 import db_api  # Our database API
 from video_recorder import VideoRecorder
@@ -502,6 +503,30 @@ if __name__ == "__main__":
         logger.critical(f"Failed to initialize database: {e}. Exiting.")
         exit(1)
     # --- End DB API Setup ---
+    archive_cleaner_main_instance = None
+    try:
+        recordings_path_main = cfg.get('RECORDING', 'output_path', fallback='./recordings/')
+        default_days_main = cfg.getint('ARCHIVE', 'retention_days', fallback=30)
+        default_size_gb_main = cfg.getfloat('ARCHIVE', 'max_size_gb', fallback=500.0)
+        cleanup_interval_hours_main = cfg.getint('ARCHIVE', 'cleanup_interval_hours', fallback=1)
+
+        archive_cleaner_main_instance = archive_manager.ArchiveCleaner(
+            db_api_module=db_api,
+            recordings_path=recordings_path_main,
+            config_max_days=default_days_main,
+            config_max_size_gb=default_size_gb_main
+        )
+        # Запуск периодической автоматической очистки
+        archive_cleaner_main_instance.run_periodic_cleanup(interval_seconds=cleanup_interval_hours_main * 3600)
+        logger.info("ArchiveCleaner (основной процесс) инициализирован и запущен периодический контроль архива.")
+    except configparser.NoSectionError as e_cfg:
+        logger.warning(
+            f"Секция ARCHIVE или RECORDING не найдена в config.conf: {e_cfg}. Автоматическая очистка архива не будет запущена.")
+    except configparser.NoOptionError as e_opt:
+        logger.warning(
+            f"Необходимая опция не найдена в config.conf для ArchiveCleaner: {e_opt}. Автоматическая очистка архива не будет запущена.")
+    except Exception as e_ac:
+        logger.error(f"Ошибка инициализации или запуска ArchiveCleaner (основной процесс): {e_ac}", exc_info=True)
 
     parser = argparse.ArgumentParser(
         description="YOLOv8 ONNX Stream Processing with Continuous Recording and DB Logging")
