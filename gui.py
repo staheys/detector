@@ -102,14 +102,14 @@ class CameraStreamWidget(ttk.Frame):
             ret, frame = self.cap.read()
             if ret and frame is not None:
                 self.last_frame = frame
-                self.update_status("Status: Streaming")  # Update status on good frame
+                self.update_status("Статус: Эфир")  # Update status on good frame
                 # Process and display frame (done in update_display typically)
             else:
                 # Frame read failed or stream ended
                 logger.warning(f"Failed to read frame from {self.stream_name}. Re-initializing capture.")
                 if self.cap: self.cap.release()
                 self.cap = None
-                self.update_status("Status: Reconnecting...")
+                self.update_status("Статус: Переподключение...")
                 self.draw_error_frame(f"Stream Interrupted\n{self.stream_name}")
                 time.sleep(1)  # Brief pause before re-initializing in the loop
                 continue  # Restart loop to re-initialize cap
@@ -120,8 +120,8 @@ class CameraStreamWidget(ttk.Frame):
         if self.cap:
             self.cap.release()
         logger.info(f"Thread finished for {self.stream_name}")
-        self.update_status("Status: Stopped")
-        self.draw_error_frame("Stream Stopped")
+        self.update_status("Статус: Остановлено")
+        self.draw_error_frame("Эфир остановлен")
 
     def start_stream(self):
         if not self.is_running:
@@ -195,8 +195,8 @@ class App(tk.Tk):
     MATPLOTLIB_AVAILABLE = True
     def __init__(self):
         super().__init__()
-        self.title("System Monitor GUI")
-        self.geometry("1800x900")
+        self.title("Наблюдение")
+        self.geometry("1200x700")
 
         # Initialize DB and ensure tables exist
         try:
@@ -236,24 +236,24 @@ class App(tk.Tk):
 
         # Tab 1: Live Camera Feeds
         self.tab_cameras = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_cameras, text='Live Feeds')
+        self.notebook.add(self.tab_cameras, text='Прямой эфир')
         self.setup_camera_tab()
-
+        #
         # Tab 2: Recorded Video Clips
         # self.tab_clips = ttk.Frame(self.notebook)
         # self.notebook.add(self.tab_clips, text='Video Clips')
         # self.setup_clips_tab()
-
+        #
         # Tab 3: Tracked Objects
         # self.tab_objects = ttk.Frame(self.notebook)
         # self.notebook.add(self.tab_objects, text='Tracked Objects')
         # self.setup_objects_tab()
 
         self.tab_composer = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_composer, text='Video Composer')
+        self.notebook.add(self.tab_composer, text='Поиск объектов')
         self.setup_composer_tab()
         self.tab_archive = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_archive, text='Archive Management')
+        self.notebook.add(self.tab_archive, text='Настрйока архива')
         self.setup_archive_tab()  # Новая функция для настройки вкладки
 
         self.notebook.pack(expand=True, fill='both', padx=10, pady=10)
@@ -283,8 +283,8 @@ class App(tk.Tk):
         num_cols = 1
         for i, cam_data in enumerate(rtsp_urls_data):
             row, col = divmod(i, num_cols)
-            cam_widget = CameraStreamWidget(camera_frame_container, cam_data["name"], cam_data["url"], width=1280,
-                                            height=720)
+            cam_widget = CameraStreamWidget(camera_frame_container, cam_data["name"], cam_data["url"], width=640,
+                                            height=480)
             cam_widget.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
             self.camera_widgets.append(cam_widget)
             camera_frame_container.grid_columnconfigure(col, weight=1)
@@ -560,7 +560,7 @@ class App(tk.Tk):
             messagebox.showerror("Input Error", f"Invalid date/time input or timezone issue: {e}")
             return None
 
-    def setup_archive_tab(self, MATPLOTLIB_AVAILABLE=None):
+    def setup_archive_tab(self, MATPLOTLIB_AVAILABLE=True):
         archive_main_frame = ttk.Frame(self.tab_archive)
         archive_main_frame.pack(padx=10, pady=10, fill='both', expand=True)
 
@@ -729,7 +729,7 @@ class App(tk.Tk):
                 button.config(state="normal")
             logger.info("Поток ручной очистки завершен, кнопка разблокирована.")
 
-    def update_disk_usage_display(self, MATPLOTLIB_AVAILABLE=None):
+    def update_disk_usage_display(self, MATPLOTLIB_AVAILABLE=True):
         if not self.archive_cleaner_instance_gui:
             logger.warning("ArchiveCleaner не инициализирован, не могу обновить использование диска.")
             if not MATPLOTLIB_AVAILABLE:

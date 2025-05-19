@@ -258,7 +258,9 @@ class YOLOv8:
 
         logger.info(f"Using ONNX Execution Providers: {final_provs}")
         try:
+
             self.session = ort.InferenceSession(model_path, providers=final_provs)
+
             inp = self.session.get_inputs()[0]
             self.in_name = inp.name
             self.w, self.h = int(inp.shape[2]), int(inp.shape[3])  # Model input dimensions
