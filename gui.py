@@ -196,7 +196,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Наблюдение")
-        self.geometry("1200x700")
+        self.geometry("1500x900")
 
         # Initialize DB and ensure tables exist
         try:
@@ -283,8 +283,8 @@ class App(tk.Tk):
         num_cols = 1
         for i, cam_data in enumerate(rtsp_urls_data):
             row, col = divmod(i, num_cols)
-            cam_widget = CameraStreamWidget(camera_frame_container, cam_data["name"], cam_data["url"], width=640,
-                                            height=480)
+            cam_widget = CameraStreamWidget(camera_frame_container, cam_data["name"], cam_data["url"], width=1280,
+                                            height=720)
             cam_widget.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
             self.camera_widgets.append(cam_widget)
             camera_frame_container.grid_columnconfigure(col, weight=1)
